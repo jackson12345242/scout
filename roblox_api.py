@@ -1,4 +1,3 @@
-
 """
 roblox_api.py
 
@@ -23,10 +22,20 @@ Notes on stability:
 import asyncio
 import aiohttp
 
-SEARCH_URL = "https://apis.roblox.com/search-api/omni-search"
-STATS_URL = "https://games.roblox.com/v1/games"
-VOTES_URL = "https://games.roblox.com/v1/games/votes"
-ICONS_URL = "https://thumbnails.roblox.com/v1/games/icons"
+# We route through RoProxy instead of hitting roblox.com directly.
+# Roblox blocks a lot of datacenter/cloud IP ranges (Railway, Heroku,
+# AWS, etc.) from its public endpoints -- that's the instant 429s you'll
+# see if you point these at *.roblox.com directly from a cloud host.
+# RoProxy is a widely-used community proxy that mirrors these same
+# public, unauthenticated endpoints under a different domain to route
+# around that block. Caveat: it's a third-party service we don't
+# control -- if it goes down, these calls fail until it's back up.
+# Since we never send a login cookie (we're only reading public game
+# data), there's no credential-leak risk in routing through it.
+SEARCH_URL = "https://apis.roproxy.com/search-api/omni-search"
+STATS_URL = "https://games.roproxy.com/v1/games"
+VOTES_URL = "https://games.roproxy.com/v1/games/votes"
+ICONS_URL = "https://thumbnails.roproxy.com/v1/games/icons"
 
 # Seed terms used to pull a spread of candidate games each scan.
 # Add/remove terms to change what kind of games you surface.
@@ -40,17 +49,23 @@ HEADERS = {
 }
 
 
-async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict):
-    try:
-        async with session.get(url, params=params, headers=HEADERS, timeout=15) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                print(f"[roblox_api] {url} returned {resp.status}: {body[:300]}")
-                return None
-            return await resp.json()
-    except Exception as e:
-        print(f"[roblox_api] request to {url} failed: {e!r}")
-        return None
+async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict, retries: int = 2):
+    for attempt in range(retries + 1):
+        try:
+            async with session.get(url, params=params, headers=HEADERS, timeout=15) as resp:
+                if resp.status == 429 and attempt < retries:
+                    print(f"[roblox_api] {url} 429'd, backing off before retry {attempt + 1}")
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                if resp.status != 200:
+                    body = await resp.text()
+                    print(f"[roblox_api] {url} returned {resp.status}: {body[:300]}")
+                    return None
+                return await resp.json()
+        except Exception as e:
+            print(f"[roblox_api] request to {url} failed: {e!r}")
+            return None
+    return None
 
 
 async def discover_candidates(session: aiohttp.ClientSession, terms=None, per_term_limit=20):
