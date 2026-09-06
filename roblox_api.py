@@ -34,15 +34,21 @@ Endpoint history (why this file looks the way it does):
   used for Roblox's own analytics). Omitting it doesn't error -- it
   just quietly comes back with zero/empty results.
 
-On the intermittent "found candidates, then 0 passed filters" reports:
-- That can legitimately happen -- CCU is live and fluctuates, so a
-  game clearing the bar one scan and not the next is expected.
-- But it can *also* happen because a batch call to STATS_URL got
-  rate-limited by RoProxy and silently dropped (get_stats just skips
-  a chunk on failure rather than raising). To make that visible instead
-  of invisible, get_stats now returns how many chunk requests failed
-  outright so callers can report it, and retries/backoff are more
-  generous than before.
+On persistent 429s from RoProxy even after batch-size shrinking:
+- RoProxy is a free, shared, community-run proxy with its own global
+  rate limits that have nothing to do with how politely any single
+  bot behaves. A scan that fires off ~16 discovery calls in quick
+  succession (10 search terms + 6 sort categories) followed
+  immediately by a burst of stats/votes/icons/social-link batch calls
+  is a lot of concentrated traffic, and RoProxy will 429 the whole
+  burst regardless of retry logic once its own limit is hit.
+- The only thing actually in our control is reducing how much and how
+  fast we hit it: smaller starting batch size, a real pause between
+  every request (not just on retry), and a short cooldown between the
+  discovery phase and the stats phase so we're not stacking two bursts
+  back to back. None of this *guarantees* RoProxy won't 429 us -- it's
+  a third-party service outside our control -- but it meaningfully
+  lowers how often we trip its limit.
 """
 
 import asyncio
@@ -57,9 +63,10 @@ import aiohttp
 # RoProxy is a widely-used community proxy that mirrors these same
 # public, unauthenticated endpoints under a different domain to route
 # around that block. Caveat: it's a third-party service we don't
-# control -- if it goes down, these calls fail until it's back up.
-# Since we never send a login cookie (we're only reading public game
-# data), there's no credential-leak risk in routing through it.
+# control -- if it goes down or rate-limits us, these calls fail until
+# it eases up. Since we never send a login cookie (we're only reading
+# public game data), there's no credential-leak risk in routing
+# through it.
 SEARCH_URL = "https://apis.roproxy.com/search-api/omni-search"
 STATS_URL = "https://games.roproxy.com/v1/games"
 VOTES_URL = "https://games.roproxy.com/v1/games/votes"
@@ -90,22 +97,35 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; RobloxScoutBot/1.0)"
 }
 
+# --- Throttling knobs ---
+# RoProxy is shared infrastructure with its own rate limits we don't
+# control. These pauses are the main lever we actually have to reduce
+# how often we trip them. Raise these further if 429s persist even
+# after this change.
+DELAY_BETWEEN_SEARCH_TERMS = 1.2
+DELAY_BETWEEN_SORTS = 1.2
+DELAY_BETWEEN_BATCH_CHUNKS = 1.5
+COOLDOWN_AFTER_DISCOVERY = 3.0  # pause before hammering stats endpoints right after a discovery burst
+DEFAULT_BATCH_SIZE = 40          # start smaller than Roblox's old ~100 cap; less concentrated load per call
+
 
 def _extract_universe_ids(obj):
     """
     Recursively walk any nested dict/list JSON structure and collect
-    every integer value found under a "universeId" key, wherever it
-    appears. This is deliberately schema-agnostic: Roblox's discovery
-    and search endpoints are undocumented and reshape their response
-    structure over time, so rather than hardcode one exact nested path
-    (which breaks silently the moment the shape changes), we just
-    harvest the IDs from wherever they show up.
+    every "universeId" value found, wherever it appears -- as an int
+    OR a numeric string (APIs often return large IDs as strings to
+    avoid precision loss).
     """
     ids = set()
     if isinstance(obj, dict):
         for key, value in obj.items():
-            if key == "universeId" and isinstance(value, int):
-                ids.add(value)
+            if key == "universeId":
+                if isinstance(value, int):
+                    ids.add(value)
+                elif isinstance(value, str) and value.isdigit():
+                    ids.add(int(value))
+                else:
+                    ids |= _extract_universe_ids(value)
             else:
                 ids |= _extract_universe_ids(value)
     elif isinstance(obj, list):
@@ -128,17 +148,18 @@ class TooManyIdsError(Exception):
 
 async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict, retries: int = 3):
     """
-    retries defaults to 3 (was 2) with slightly longer, jittered
-    backoff -- RoProxy 429s intermittently under normal use, and the
-    old settings gave up on a rate-limited chunk a bit too eagerly,
-    which is most of what caused "found candidates but 0 stats/matches"
-    on some runs.
+    retries defaults to 3 with longer, jittered backoff. Note this
+    backoff only kicks in *after* we've already been 429'd once -- the
+    real fix for a proxy that's rate-limiting us globally is not
+    retrying harder, it's requesting less often in the first place
+    (see the DELAY_BETWEEN_* constants used by callers of this
+    function).
     """
     for attempt in range(retries + 1):
         try:
             async with session.get(url, params=params, headers=HEADERS, timeout=20) as resp:
                 if resp.status == 429 and attempt < retries:
-                    backoff = 3 * (attempt + 1) + random.uniform(0, 1.5)
+                    backoff = 4 * (attempt + 1) + random.uniform(0, 2.0)
                     print(f"[roblox_api] {url} 429'd, backing off {backoff:.1f}s before retry {attempt + 1}")
                     await asyncio.sleep(backoff)
                     continue
@@ -166,13 +187,15 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict, re
     return None
 
 
-async def _fetch_batched(session, url, ids, static_params, id_param="universeIds", max_batch=100):
+async def _fetch_batched(session, url, ids, static_params, id_param="universeIds", max_batch=DEFAULT_BATCH_SIZE):
     """
     Fetches `ids` against `url` in batches, merging each batch's
     "data" array into one list. If Roblox rejects a batch as having
     too many IDs, the batch size is halved and that same slice is
-    retried -- so this self-corrects if Roblox's real limit changes
-    again, instead of us hardcoding a fresh guess each time it does.
+    retried. A fixed pause happens between every chunk request
+    (success or failure) -- not just on retry -- since the point is to
+    avoid tripping RoProxy's rate limit in the first place, not just
+    to recover gracefully once we have.
 
     Returns (entries, failed_chunk_count).
     """
@@ -202,12 +225,12 @@ async def _fetch_batched(session, url, ids, static_params, id_param="universeIds
         if data is None:
             failed += 1
             i += batch_size
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(DELAY_BETWEEN_BATCH_CHUNKS)
             continue
 
         results.extend(data.get("data", []))
         i += batch_size
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(DELAY_BETWEEN_BATCH_CHUNKS)
 
     return results, failed
 
@@ -238,7 +261,7 @@ async def discover_via_search(session, terms=None, per_term_limit=20):
         universe_ids |= found
         print(f"[roblox_api] search '{term}' -> {len(found)} universeIds")
 
-        await asyncio.sleep(0.5)  # be polite, avoid rate limiting
+        await asyncio.sleep(DELAY_BETWEEN_SEARCH_TERMS)
 
     return universe_ids
 
@@ -294,7 +317,7 @@ async def discover_via_sorts(session, per_sort_limit=50):
         print(f"[roblox_api] sort '{name}' -> {len(found)} universeIds")
         universe_ids |= found
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(DELAY_BETWEEN_SORTS)
 
     return universe_ids
 
@@ -313,6 +336,13 @@ async def discover_candidates(session, terms=None, per_term_limit=20):
     universe_ids = search_ids | sort_ids
     print(f"[roblox_api] discover_candidates total unique universeIds: "
           f"{len(universe_ids)} (search: {len(search_ids)}, sorts: {len(sort_ids)})")
+
+    # Give RoProxy a breather before we immediately start hammering it
+    # again with stats/votes/icons/social-link batch calls -- discovery
+    # alone is already ~16 requests in quick succession.
+    print(f"[roblox_api] cooling down {COOLDOWN_AFTER_DISCOVERY}s before stats lookups...")
+    await asyncio.sleep(COOLDOWN_AFTER_DISCOVERY)
+
     return universe_ids
 
 
@@ -363,7 +393,7 @@ async def get_icons(session: aiohttp.ClientSession, universe_ids):
     return icons
 
 
-async def get_social_links(session: aiohttp.ClientSession, universe_ids, concurrency=5):
+async def get_social_links(session: aiohttp.ClientSession, universe_ids, concurrency=3):
     """
     Returns { universeId: {"discord": url_or_None} }
 
@@ -371,7 +401,8 @@ async def get_social_links(session: aiohttp.ClientSession, universe_ids, concurr
     batching), so we cap how many run concurrently to avoid hammering
     RoProxy -- this is only called for games that already passed the
     scouting filters, so the id list here is small (top matches, not
-    every candidate).
+    every candidate). Concurrency dropped from 5 to 3 to go a bit
+    easier on RoProxy given the broader 429 issues.
     """
     universe_ids = list(universe_ids)
     results = {}
@@ -391,7 +422,7 @@ async def get_social_links(session: aiohttp.ClientSession, universe_ids, concurr
                         discord_url = link.get("url")
                         break
             results[uid] = {"discord": discord_url}
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.4)
 
     await asyncio.gather(*(fetch_one(uid) for uid in universe_ids))
     return results
