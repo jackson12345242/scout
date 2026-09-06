@@ -11,6 +11,7 @@ Jobs:
 2. get_stats(universe_ids) -> live CCU / visits / favorites
 3. get_votes(universe_ids) -> upvotes/downvotes
 4. get_icons(universe_ids) -> game icon image URLs
+5. get_social_links(universe_ids) -> attached social links (Discord, etc.)
 
 Notes on stability:
 - `games.roblox.com/v1/games?universeIds=...` (get_stats) is the well
@@ -31,12 +32,21 @@ Endpoint history (why this file looks the way it does):
 - Both the new explore-api endpoints AND the omni-search endpoint
   expect a `sessionId` query param (any GUID-ish string works; it's
   used for Roblox's own analytics). Omitting it doesn't error -- it
-  just quietly comes back with zero/empty results, which is why the
-  search calls below were returning 0 universeIds instead of failing
-  loudly.
+  just quietly comes back with zero/empty results.
+
+On the intermittent "found candidates, then 0 passed filters" reports:
+- That can legitimately happen -- CCU is live and fluctuates, so a
+  game clearing the bar one scan and not the next is expected.
+- But it can *also* happen because a batch call to STATS_URL got
+  rate-limited by RoProxy and silently dropped (get_stats just skips
+  a chunk on failure rather than raising). To make that visible instead
+  of invisible, get_stats now returns how many chunk requests failed
+  outright so callers can report it, and retries/backoff are more
+  generous than before.
 """
 
 import asyncio
+import random
 import uuid
 import aiohttp
 
@@ -54,6 +64,7 @@ SEARCH_URL = "https://apis.roproxy.com/search-api/omni-search"
 STATS_URL = "https://games.roproxy.com/v1/games"
 VOTES_URL = "https://games.roproxy.com/v1/games/votes"
 ICONS_URL = "https://thumbnails.roproxy.com/v1/games/icons"
+SOCIAL_LINKS_URL = "https://games.roproxy.com/v1/games/{universe_id}/social-links/list"
 
 # NOTE: the old games.roblox.com/v1/games/sorts + /v1/games/list pair
 # is deprecated (confirmed 404, per Roblox's own deprecation notice).
@@ -103,13 +114,21 @@ def _extract_universe_ids(obj):
     return ids
 
 
-async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict, retries: int = 2):
+async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict, retries: int = 3):
+    """
+    retries defaults to 3 (was 2) with slightly longer, jittered
+    backoff -- RoProxy 429s intermittently under normal use, and the
+    old settings gave up on a rate-limited chunk a bit too eagerly,
+    which is most of what caused "found candidates but 0 stats/matches"
+    on some runs.
+    """
     for attempt in range(retries + 1):
         try:
-            async with session.get(url, params=params, headers=HEADERS, timeout=15) as resp:
+            async with session.get(url, params=params, headers=HEADERS, timeout=20) as resp:
                 if resp.status == 429 and attempt < retries:
-                    print(f"[roblox_api] {url} 429'd, backing off before retry {attempt + 1}")
-                    await asyncio.sleep(2 * (attempt + 1))
+                    backoff = 3 * (attempt + 1) + random.uniform(0, 1.5)
+                    print(f"[roblox_api] {url} 429'd, backing off {backoff:.1f}s before retry {attempt + 1}")
+                    await asyncio.sleep(backoff)
                     continue
                 if resp.status != 200:
                     body = await resp.text()
@@ -117,6 +136,11 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict, re
                     return None
                 return await resp.json()
         except Exception as e:
+            if attempt < retries:
+                backoff = 2 * (attempt + 1)
+                print(f"[roblox_api] request to {url} failed ({e!r}), retrying in {backoff}s")
+                await asyncio.sleep(backoff)
+                continue
             print(f"[roblox_api] request to {url} failed: {e!r}")
             return None
     return None
@@ -232,9 +256,16 @@ async def get_stats(session: aiohttp.ClientSession, universe_ids):
     { id, name, playing, visits, favoritedCount, created, updated }
     Roblox allows batching multiple ids in one call (comma separated),
     capped conservatively at 100 per request here.
+
+    Returns a (results, failed_chunks) tuple -- failed_chunks is how
+    many of the batch requests came back empty after retries, so
+    callers can tell "0 stats because nothing matched" apart from
+    "0 stats because RoProxy dropped every request." Those look
+    identical if you only look at len(results).
     """
     universe_ids = list(universe_ids)
     results = []
+    failed_chunks = 0
 
     for i in range(0, len(universe_ids), 100):
         chunk = universe_ids[i:i + 100]
@@ -244,11 +275,12 @@ async def get_stats(session: aiohttp.ClientSession, universe_ids):
             params={"universeIds": ",".join(str(u) for u in chunk)},
         )
         if not data:
+            failed_chunks += 1
             continue
         results.extend(data.get("data", []))
         await asyncio.sleep(0.3)
 
-    return results
+    return results, failed_chunks
 
 
 async def get_votes(session: aiohttp.ClientSession, universe_ids):
@@ -304,6 +336,40 @@ async def get_icons(session: aiohttp.ClientSession, universe_ids):
         await asyncio.sleep(0.3)
 
     return icons
+
+
+async def get_social_links(session: aiohttp.ClientSession, universe_ids, concurrency=5):
+    """
+    Returns { universeId: {"discord": url_or_None} }
+
+    Unlike stats/votes/icons, this endpoint is per-universeId (no
+    batching), so we cap how many run concurrently to avoid hammering
+    RoProxy -- this is only called for games that already passed the
+    scouting filters, so the id list here is small (top matches, not
+    every candidate).
+    """
+    universe_ids = list(universe_ids)
+    results = {}
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def fetch_one(uid):
+        async with semaphore:
+            data = await _fetch_json(
+                session,
+                SOCIAL_LINKS_URL.format(universe_id=uid),
+                params={},
+            )
+            discord_url = None
+            if data:
+                for link in data.get("data", []):
+                    if str(link.get("type", "")).lower() == "discord":
+                        discord_url = link.get("url")
+                        break
+            results[uid] = {"discord": discord_url}
+            await asyncio.sleep(0.2)
+
+    await asyncio.gather(*(fetch_one(uid) for uid in universe_ids))
+    return results
 
 
 def apply_filters(games, min_ccu, max_visits):
