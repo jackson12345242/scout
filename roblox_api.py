@@ -22,9 +22,22 @@ Notes on stability:
   is less likely to silently break discovery.
 - There is no official "give me every game filtered by CCU/visits"
   endpoint. This is always a sample of the platform, not a full crawl.
+
+Endpoint history (why this file looks the way it does):
+- `games.roblox.com/v1/games/sorts` and `.../v1/games/list` were
+  Roblox's old Discover-page endpoints. Roblox has since deprecated
+  both in favor of a *different host*: `apis.roblox.com/explore-api`.
+  The old ones now just 404 -- they're gone, not rate-limited.
+- Both the new explore-api endpoints AND the omni-search endpoint
+  expect a `sessionId` query param (any GUID-ish string works; it's
+  used for Roblox's own analytics). Omitting it doesn't error -- it
+  just quietly comes back with zero/empty results, which is why the
+  search calls below were returning 0 universeIds instead of failing
+  loudly.
 """
 
 import asyncio
+import uuid
 import aiohttp
 
 # We route through RoProxy instead of hitting roblox.com directly.
@@ -41,8 +54,19 @@ SEARCH_URL = "https://apis.roproxy.com/search-api/omni-search"
 STATS_URL = "https://games.roproxy.com/v1/games"
 VOTES_URL = "https://games.roproxy.com/v1/games/votes"
 ICONS_URL = "https://thumbnails.roproxy.com/v1/games/icons"
-SORTS_URL = "https://games.roproxy.com/v1/games/sorts"
-LIST_URL = "https://games.roproxy.com/v1/games/list"
+
+# NOTE: the old games.roblox.com/v1/games/sorts + /v1/games/list pair
+# is deprecated (confirmed 404, per Roblox's own deprecation notice).
+# The replacement lives under apis.roblox.com/explore-api, not
+# games.roblox.com, so the proxy host changes too.
+EXPLORE_SORTS_URL = "https://apis.roproxy.com/explore-api/v1/get-sorts"
+EXPLORE_SORT_CONTENT_URL = "https://apis.roproxy.com/explore-api/v1/get-sort-content"
+
+# Roblox's search/explore backends want a session id for analytics
+# purposes. It doesn't need to be tied to a real login -- any stable
+# GUID for the run works -- but omitting it entirely causes these
+# endpoints to quietly return empty results rather than erroring.
+SESSION_ID = str(uuid.uuid4())
 
 # Seed terms used to pull a spread of candidate games each scan via
 # keyword search.
@@ -110,7 +134,11 @@ async def discover_via_search(session, terms=None, per_term_limit=20):
         data = await _fetch_json(
             session,
             SEARCH_URL,
-            params={"searchQuery": term, "pageType": "games"},
+            params={
+                "searchQuery": term,
+                "pageType": "all",
+                "sessionId": SESSION_ID,
+            },
         )
         if not data:
             print(f"[roblox_api] search for '{term}' returned no data")
@@ -132,31 +160,47 @@ async def discover_via_sorts(session, per_sort_limit=50):
     is a much wider net than keyword search -- typically dozens to a
     few hundred games per sort -- so we pull from every sort we're
     given rather than just one or two.
+
+    This hits the current apis.roblox.com/explore-api endpoints --
+    the old games.roblox.com/v1/games/sorts + /list pair Roblox used
+    for this is deprecated and just 404s now.
     """
     universe_ids = set()
 
-    sorts_data = await _fetch_json(session, SORTS_URL, params={"gameSetTypeId": 1})
+    sorts_data = await _fetch_json(
+        session,
+        EXPLORE_SORTS_URL,
+        params={"sessionId": SESSION_ID, "device": "computer", "country": "all"},
+    )
     if not sorts_data:
-        print("[roblox_api] sorts endpoint returned no data")
+        print("[roblox_api] explore-api get-sorts returned no data")
         return universe_ids
 
     sorts = sorts_data.get("sorts", [])
     print(f"[roblox_api] found {len(sorts)} sort categories")
 
     for sort in sorts:
-        token = sort.get("token")
+        sort_id = sort.get("sortId") or sort.get("token")
         name = sort.get("sortDisplayName") or sort.get("name") or "unknown"
-        if not token:
+        if not sort_id:
             continue
 
-        list_data = await _fetch_json(
-            session, LIST_URL, params={"sortToken": token, "limit": per_sort_limit}
+        content_data = await _fetch_json(
+            session,
+            EXPLORE_SORT_CONTENT_URL,
+            params={
+                "sessionId": SESSION_ID,
+                "sortId": sort_id,
+                "device": "computer",
+                "country": "all",
+                "maxRows": per_sort_limit,
+            },
         )
-        if not list_data:
+        if not content_data:
             print(f"[roblox_api] sort '{name}' returned no data")
             continue
 
-        found = _extract_universe_ids(list_data)
+        found = _extract_universe_ids(content_data)
         print(f"[roblox_api] sort '{name}' -> {len(found)} universeIds")
         universe_ids |= found
 
