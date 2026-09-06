@@ -8,14 +8,20 @@ Commands:
   ?setfilters 150 150000 -> updates the saved filters used by ?scan
                              (no args) and by auto-scan
   ?filters            -> shows the current saved filters
+  ?poll               -> shows when the next auto-scan will run
 
 Also runs a background loop every AUTO_SCAN_INTERVAL_MINUTES that posts
-new matches to ALERT_CHANNEL_ID, or PRIORITY_CHANNEL_ID if the computed
-score is >= PRIORITY_SCORE_THRESHOLD.
+the top AUTO_SCAN_POST_LIMIT new matches to ALERT_CHANNEL_ID, or
+PRIORITY_CHANNEL_ID if the computed score is >= PRIORITY_SCORE_THRESHOLD.
+
+Unhandled errors (bad commands, network failures, anything that slips
+through) get posted as a traceback embed to ERROR_CHANNEL_ID so they
+show up in Discord instead of only in process logs.
 """
 
 import json
 import os
+import traceback
 from datetime import datetime, timezone
 
 import aiohttp
@@ -82,6 +88,37 @@ def update_history(game):
     return seen_games[uid]
 
 
+# ---------- error reporting ----------
+
+async def report_error(source: str, error: Exception):
+    """
+    Posts a traceback embed to ERROR_CHANNEL_ID. Never raises itself --
+    if the error channel is unreachable we fall back to printing, since
+    the whole point is to not lose visibility into failures.
+    """
+    print(f"[error] {source}: {error!r}")
+
+    channel = bot.get_channel(config.ERROR_CHANNEL_ID)
+    if channel is None:
+        print(f"[error] can't reach ERROR_CHANNEL_ID ({config.ERROR_CHANNEL_ID}) to post this error")
+        return
+
+    tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    if len(tb) > 1800:
+        tb = "...\n" + tb[-1800:]
+
+    embed = discord.Embed(
+        title=f"\u26A0\uFE0F Error in {source}",
+        description=f"```py\n{tb}\n```",
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException as send_err:
+        print(f"[error] failed to post error embed for {source}: {send_err!r}")
+
+
 # ---------- embed building ----------
 
 def score_color(score):
@@ -94,7 +131,7 @@ def score_color(score):
     return discord.Color.greyple()
 
 
-def build_embed(game, score, breakdown, votes, icon_url):
+def build_embed(game, score, breakdown, votes, icon_url, social=None):
     created = game.get("created", "")[:10]
     updated = game.get("updated", "")[:10]
     creator = game.get("creator", {}).get("name", "Unknown")
@@ -135,6 +172,14 @@ def build_embed(game, score, breakdown, votes, icon_url):
         value=f"Favorites: **{game.get('favoritedCount', 0):,}**",
         inline=True,
     )
+
+    discord_url = social.get("discord") if social else None
+    embed.add_field(
+        name="\U0001F4AC Discord",
+        value=f"[Server linked]({discord_url})" if discord_url else "Not linked",
+        inline=True,
+    )
+
     embed.add_field(
         name="\U0001F3F7\uFE0F Metadata",
         value=f"Genre: **{genre}**\nCreator: **{creator}**\nUpdated: **{updated or 'Unknown'}**",
@@ -193,8 +238,8 @@ class ScoutView(discord.ui.View):
 
 async def run_scan(min_ccu, max_visits, status_callback=None):
     """
-    Returns a list of (game, score, breakdown, votes, icon_url) tuples,
-    sorted by score descending.
+    Returns a list of (game, score, breakdown, votes, icon_url, social)
+    tuples, sorted by score descending.
     status_callback: optional async function(str) to report progress,
                       e.g. ctx.send, so diagnostics show up in Discord.
     """
@@ -203,9 +248,12 @@ async def run_scan(min_ccu, max_visits, status_callback=None):
         if status_callback:
             await status_callback(f"Found **{len(candidate_ids)}** candidate universeIds from search.")
 
-        stats = await roblox_api.get_stats(session, candidate_ids)
+        stats, failed_chunks = await roblox_api.get_stats(session, candidate_ids)
         if status_callback:
-            await status_callback(f"Pulled stats for **{len(stats)}** games.")
+            note = ""
+            if failed_chunks:
+                note = f" ({failed_chunks} batch request(s) failed after retries -- likely rate-limited, not a real 0)"
+            await status_callback(f"Pulled stats for **{len(stats)}** games{note}.")
 
         matches = roblox_api.apply_filters(stats, min_ccu, max_visits)
         if status_callback:
@@ -217,6 +265,7 @@ async def run_scan(min_ccu, max_visits, status_callback=None):
         match_ids = [g["id"] for g in matches]
         votes_by_id = await roblox_api.get_votes(session, match_ids)
         icons_by_id = await roblox_api.get_icons(session, match_ids)
+        social_by_id = await roblox_api.get_social_links(session, match_ids)
 
     results = []
     for game in matches:
@@ -224,15 +273,16 @@ async def run_scan(min_ccu, max_visits, status_callback=None):
         votes = votes_by_id.get(game["id"])
         score, breakdown = scoring.compute_score(game, votes, history_entry)
         icon_url = icons_by_id.get(game["id"])
-        results.append((game, score, breakdown, votes, icon_url))
+        social = social_by_id.get(game["id"])
+        results.append((game, score, breakdown, votes, icon_url, social))
 
     save_seen(seen_games)  # persist first-seen data collected this scan
     results.sort(key=lambda r: r[1], reverse=True)
     return results
 
 
-async def post_result(destination, game, score, breakdown, votes, icon_url, prefix=None):
-    embed = build_embed(game, score, breakdown, votes, icon_url)
+async def post_result(destination, game, score, breakdown, votes, icon_url, social, prefix=None):
+    embed = build_embed(game, score, breakdown, votes, icon_url, social)
     await destination.send(content=prefix, embed=embed, view=ScoutView())
 
 
@@ -240,12 +290,18 @@ async def post_result(destination, game, score, breakdown, votes, icon_url, pref
 
 @bot.event
 async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(f"Usage: `?{ctx.command.name} <min_ccu> <max_visits>`")
-    elif isinstance(error, commands.BadArgument):
+        return
+    if isinstance(error, commands.BadArgument):
         await ctx.send("Both values need to be whole numbers, e.g. `?setfilters 150 150000`")
-    else:
-        raise error
+        return
+
+    original = getattr(error, "original", error)
+    await ctx.send(f"\u26A0\uFE0F Something went wrong running that command -- I've logged the error.")
+    await report_error(f"command `?{ctx.command}`", original)
 
 
 @bot.event
@@ -262,14 +318,19 @@ async def scan(ctx, min_ccu: int = None, max_visits: int = None):
 
     await ctx.send(f"Scanning for games with {min_ccu}+ CCU and under {max_visits:,} visits...")
 
-    results = await run_scan(min_ccu, max_visits, status_callback=ctx.send)
+    try:
+        results = await run_scan(min_ccu, max_visits, status_callback=ctx.send)
+    except Exception as e:
+        await ctx.send("\u26A0\uFE0F Scan failed partway through -- I've logged the error.")
+        await report_error("`?scan` command", e)
+        return
 
     if not results:
         await ctx.send("No matches found this scan. Try again later or widen your filters.")
         return
 
-    for game, score, breakdown, votes, icon_url in results[:10]:
-        await post_result(ctx.channel, game, score, breakdown, votes, icon_url)
+    for game, score, breakdown, votes, icon_url, social in results[:10]:
+        await post_result(ctx.channel, game, score, breakdown, votes, icon_url, social)
 
 
 @bot.command(name="setfilters")
@@ -297,8 +358,40 @@ async def show_filters(ctx):
     )
 
 
+@bot.command(name="poll")
+async def poll(ctx):
+    """Shows when the next auto-scan will run."""
+    if not config.AUTO_SCAN_ENABLED:
+        await ctx.send("Auto-scan is disabled in config right now.")
+        return
+    if not auto_scan_loop.is_running():
+        await ctx.send("Auto-scan isn't running (it may have crashed -- check the error channel).")
+        return
+
+    next_run = auto_scan_loop.next_iteration
+    if next_run is None:
+        await ctx.send("Auto-scan is running but hasn't scheduled its next run yet -- try again in a moment.")
+        return
+
+    ts = int(next_run.timestamp())
+    await ctx.send(
+        f"Next auto-scan: <t:{ts}:R> (<t:{ts}:T>) -- posting top **{config.AUTO_SCAN_POST_LIMIT}** "
+        f"matches every **{config.AUTO_SCAN_INTERVAL_MINUTES}** minutes."
+    )
+
+
 @tasks.loop(minutes=config.AUTO_SCAN_INTERVAL_MINUTES)
 async def auto_scan_loop():
+    # Wrapped in try/except so one bad run (network blip, RoProxy
+    # outage, etc.) doesn't silently kill the whole loop -- it just
+    # reports the error and waits for the next scheduled interval.
+    try:
+        await _run_auto_scan()
+    except Exception as e:
+        await report_error("auto_scan_loop", e)
+
+
+async def _run_auto_scan():
     alert_channel = bot.get_channel(config.ALERT_CHANNEL_ID)
     priority_channel = bot.get_channel(config.PRIORITY_CHANNEL_ID)
 
@@ -308,19 +401,24 @@ async def auto_scan_loop():
 
     results = await run_scan(current_min_ccu, current_max_visits)
 
-    for game, score, breakdown, votes, icon_url in results[:10]:
+    posted = 0
+    for game, score, breakdown, votes, icon_url, social in results:
+        if posted >= config.AUTO_SCAN_POST_LIMIT:
+            break
+
         uid = str(game.get("id"))
         if seen_games.get(uid, {}).get("alerted"):
             continue  # already alerted on this one before
 
         if score >= config.PRIORITY_SCORE_THRESHOLD and priority_channel is not None:
-            await post_result(priority_channel, game, score, breakdown, votes, icon_url,
+            await post_result(priority_channel, game, score, breakdown, votes, icon_url, social,
                                prefix="**\U0001F525 High-priority match**")
         else:
-            await post_result(alert_channel, game, score, breakdown, votes, icon_url,
+            await post_result(alert_channel, game, score, breakdown, votes, icon_url, social,
                                prefix="**New scouting match**")
 
         seen_games[uid]["alerted"] = True
+        posted += 1
 
     save_seen(seen_games)
 
