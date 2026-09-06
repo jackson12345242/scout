@@ -1,329 +1,211 @@
 """
-Roblox Acquisition Scout Bot
+roblox_api.py
 
-Commands:
-  ?scan               -> runs a scan now using the current live filters
-  ?scan 50 500000     -> one-off scan with custom min_ccu / max_visits
-                          (doesn't change your saved filters)
-  ?setfilters 150 150000 -> updates the saved filters used by ?scan
-                             (no args) and by auto-scan
-  ?filters            -> shows the current saved filters
+Thin wrapper around Roblox's public HTTP endpoints.
 
-Also runs a background loop every AUTO_SCAN_INTERVAL_MINUTES that posts
-new matches to ALERT_CHANNEL_ID, or PRIORITY_CHANNEL_ID if the computed
-score is >= PRIORITY_SCORE_THRESHOLD.
+Two jobs:
+1. discover_candidates() -> a list of universeIds worth checking
+2. get_stats(universe_ids) -> live CCU / visits / favorites for those ids
+
+Notes on stability:
+- `games.roblox.com/v1/games?universeIds=...` (get_stats) is the well
+  documented, stable endpoint. It's safe to rely on.
+- Roblox does not offer an official "give me every game filtered by
+  CCU/visits" endpoint. Discovery is done by searching a rotating list
+  of keywords/genres via the public search API and collecting the
+  universeIds that come back. This is inherently a *sample*, not a full
+  crawl of Roblox -- it will miss games that don't match any seed term.
+  If Roblox changes this endpoint's shape, discover_candidates() is the
+  only function you should need to fix.
 """
 
-import json
-import os
-from datetime import datetime, timezone
-
+import asyncio
 import aiohttp
-import discord
-from discord.ext import commands, tasks
 
-import config
-import roblox_api
-import scoring
+# We route through RoProxy instead of hitting roblox.com directly.
+# Roblox blocks a lot of datacenter/cloud IP ranges (Railway, Heroku,
+# AWS, etc.) from its public endpoints -- that's the instant 429s you'll
+# see if you point these at *.roblox.com directly from a cloud host.
+# RoProxy is a widely-used community proxy that mirrors these same
+# public, unauthenticated endpoints under a different domain to route
+# around that block. Caveat: it's a third-party service we don't
+# control -- if it goes down, these calls fail until it's back up.
+# Since we never send a login cookie (we're only reading public game
+# data), there's no credential-leak risk in routing through it.
+SEARCH_URL = "https://apis.roproxy.com/search-api/omni-search"
+STATS_URL = "https://games.roproxy.com/v1/games"
+VOTES_URL = "https://games.roproxy.com/v1/games/votes"
+ICONS_URL = "https://thumbnails.roproxy.com/v1/games/icons"
 
-intents = discord.Intents.default()
-intents.message_content = True
+# Seed terms used to pull a spread of candidate games each scan.
+# Add/remove terms to change what kind of games you surface.
+SEED_TERMS = [
+    "simulator", "tycoon", "obby", "roleplay", "horror",
+    "anime", "fighting", "survival", "adventure", "clicker",
+]
 
-bot = commands.Bot(command_prefix=config.COMMAND_PREFIX, intents=intents)
-
-
-# ---------- persistence: live filters ----------
-
-FILTERS_FILE = "filters.json"
-
-
-def load_filters():
-    if os.path.exists(FILTERS_FILE):
-        with open(FILTERS_FILE, "r") as f:
-            data = json.load(f)
-            return data.get("min_ccu", config.MIN_CCU), data.get("max_visits", config.MAX_VISITS)
-    return config.MIN_CCU, config.MAX_VISITS
-
-
-def save_filters(min_ccu, max_visits):
-    with open(FILTERS_FILE, "w") as f:
-        json.dump({"min_ccu": min_ccu, "max_visits": max_visits}, f)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; RobloxScoutBot/1.0)"
+}
 
 
-current_min_ccu, current_max_visits = load_filters()
+async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict, retries: int = 2):
+    for attempt in range(retries + 1):
+        try:
+            async with session.get(url, params=params, headers=HEADERS, timeout=15) as resp:
+                if resp.status == 429 and attempt < retries:
+                    print(f"[roblox_api] {url} 429'd, backing off before retry {attempt + 1}")
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                if resp.status != 200:
+                    body = await resp.text()
+                    print(f"[roblox_api] {url} returned {resp.status}: {body[:300]}")
+                    return None
+                return await resp.json()
+        except Exception as e:
+            print(f"[roblox_api] request to {url} failed: {e!r}")
+            return None
+    return None
 
 
-# ---------- persistence: seen games + growth history ----------
+async def discover_candidates(session: aiohttp.ClientSession, terms=None, per_term_limit=20):
+    """
+    Search a set of seed terms and collect unique universeIds.
+    Returns a set of universeIds (ints).
+    """
+    terms = terms or SEED_TERMS
+    universe_ids = set()
 
-def load_seen():
-    if os.path.exists(config.SEEN_GAMES_FILE):
-        with open(config.SEEN_GAMES_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-
-def save_seen(seen):
-    with open(config.SEEN_GAMES_FILE, "w") as f:
-        json.dump(seen, f)
-
-
-seen_games = load_seen()  # { "universeId(str)": {"first_playing": int, "first_seen_iso": str, "alerted": bool} }
-
-
-def update_history(game):
-    """Record first-seen stats for a game, or return its existing history."""
-    uid = str(game.get("id"))
-    if uid not in seen_games:
-        seen_games[uid] = {
-            "first_playing": game.get("playing", 0),
-            "first_seen_iso": datetime.now(timezone.utc).isoformat(),
-            "alerted": False,
-        }
-    return seen_games[uid]
-
-
-# ---------- embed building ----------
-
-def score_color(score):
-    if score >= config.PRIORITY_SCORE_THRESHOLD:
-        return discord.Color.gold()
-    if score >= 60:
-        return discord.Color.green()
-    if score >= 40:
-        return discord.Color.orange()
-    return discord.Color.greyple()
-
-
-def build_embed(game, score, breakdown, votes, icon_url):
-    created = game.get("created", "")[:10]
-    updated = game.get("updated", "")[:10]
-    creator = game.get("creator", {}).get("name", "Unknown")
-    genre = game.get("genre", "All")
-
-    up = votes.get("upVotes", 0) if votes else 0
-    down = votes.get("downVotes", 0) if votes else 0
-    total_votes = up + down
-    like_ratio = (up / total_votes * 100) if total_votes else 0
-
-    tag = "\U0001F195 Early Discovery!" if _is_new(created) else "\U0001F4C8 Scouting Match"
-
-    embed = discord.Embed(
-        title=game.get("name", "Unknown game"),
-        url=roblox_api.game_url(game),
-        description=f"**{tag}**",
-        color=score_color(score),
-    )
-    if icon_url:
-        embed.set_thumbnail(url=icon_url)
-
-    embed.add_field(name="\U0001F9EE Score", value=f"**{score}/100**", inline=True)
-    embed.add_field(name="\U0001F194 Universe ID", value=str(game.get("id")), inline=True)
-    embed.add_field(name="\U0001F5D3 Created", value=created or "Unknown", inline=True)
-
-    embed.add_field(
-        name="\U0001F4CA Current Stats",
-        value=f"Players Online: **{game.get('playing', 0):,}**\nTotal Visits: **{game.get('visits', 0):,}**",
-        inline=False,
-    )
-    embed.add_field(
-        name="\U0001F44D Ratings",
-        value=f"Upvotes: **{up:,}**\nDownvotes: **{down:,}**\nLike Ratio: **{like_ratio:.1f}%**",
-        inline=True,
-    )
-    embed.add_field(
-        name="\u2B50 Engagement",
-        value=f"Favorites: **{game.get('favoritedCount', 0):,}**",
-        inline=True,
-    )
-    embed.add_field(
-        name="\U0001F3F7\uFE0F Metadata",
-        value=f"Genre: **{genre}**\nCreator: **{creator}**\nUpdated: **{updated or 'Unknown'}**",
-        inline=False,
-    )
-    embed.add_field(
-        name="\U0001F9EE Score Breakdown",
-        value=(
-            f"CCU: {breakdown['ccu']}/{config.SCORE_WEIGHTS['ccu']} \u2022 "
-            f"Headroom: {breakdown['headroom']}/{config.SCORE_WEIGHTS['headroom']} \u2022 "
-            f"Likes: {breakdown['likes']}/{config.SCORE_WEIGHTS['likes']} \u2022 "
-            f"Favorites: {breakdown['favorites']}/{config.SCORE_WEIGHTS['favorites']} \u2022 "
-            f"Growth: {breakdown['growth']}/{config.SCORE_WEIGHTS['growth']}"
-        ),
-        inline=False,
-    )
-
-    embed.set_footer(text="Roblox Acquisition Scout")
-    embed.timestamp = datetime.now(timezone.utc)
-    return embed
-
-
-def _is_new(created_date_str, days=30):
-    if not created_date_str:
-        return False
-    try:
-        created = datetime.strptime(created_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return False
-    return (datetime.now(timezone.utc) - created).days <= days
-
-
-# ---------- buttons ----------
-
-class ScoutView(discord.ui.View):
-    """Claim / Priority buttons attached to each match message."""
-
-    def __init__(self):
-        super().__init__(timeout=None)  # buttons stay live for the runtime of the bot
-
-    @discord.ui.button(label="Claim", style=discord.ButtonStyle.success)
-    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
-        button.disabled = True
-        button.label = f"Claimed by {interaction.user.display_name}"
-        await interaction.response.edit_message(view=self)
-
-    @discord.ui.button(label="Priority", style=discord.ButtonStyle.primary)
-    async def mark_priority(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            f"\U0001F525 {interaction.user.mention} flagged this as priority.",
-            ephemeral=False,
+    for term in terms:
+        data = await _fetch_json(
+            session,
+            SEARCH_URL,
+            params={"searchQuery": term, "pageType": "games"},
         )
+        if not data:
+            print(f"[roblox_api] search for '{term}' returned no data")
+            continue
+
+        found_this_term = 0
+        # The search API nests results under searchResults -> contents.
+        # We defensively walk the structure since Roblox can reshape this.
+        for block in data.get("searchResults", []):
+            for item in block.get("contents", [])[:per_term_limit]:
+                uid = item.get("universeId")
+                if uid:
+                    universe_ids.add(uid)
+                    found_this_term += 1
+
+        print(f"[roblox_api] search '{term}' -> {found_this_term} universeIds "
+              f"(raw keys: {list(data.keys())})")
+
+        await asyncio.sleep(0.5)  # be polite, avoid rate limiting
+
+    print(f"[roblox_api] discover_candidates total unique universeIds: {len(universe_ids)}")
+    return universe_ids
 
 
-# ---------- scan logic ----------
-
-async def run_scan(min_ccu, max_visits, status_callback=None):
+async def get_stats(session: aiohttp.ClientSession, universe_ids):
     """
-    Returns a list of (game, score, breakdown, votes, icon_url) tuples,
-    sorted by score descending.
-    status_callback: optional async function(str) to report progress,
-                      e.g. ctx.send, so diagnostics show up in Discord.
+    Given an iterable of universeIds, return a list of dicts:
+    { id, name, playing, visits, favoritedCount, created, updated }
+    Roblox allows batching multiple ids in one call (comma separated),
+    capped conservatively at 100 per request here.
     """
-    async with aiohttp.ClientSession() as session:
-        candidate_ids = await roblox_api.discover_candidates(session)
-        if status_callback:
-            await status_callback(f"Found **{len(candidate_ids)}** candidate universeIds from search.")
-
-        stats = await roblox_api.get_stats(session, candidate_ids)
-        if status_callback:
-            await status_callback(f"Pulled stats for **{len(stats)}** games.")
-
-        matches = roblox_api.apply_filters(stats, min_ccu, max_visits)
-        if status_callback:
-            await status_callback(f"**{len(matches)}** passed your CCU/visits filters.")
-
-        if not matches:
-            return []
-
-        match_ids = [g["id"] for g in matches]
-        votes_by_id = await roblox_api.get_votes(session, match_ids)
-        icons_by_id = await roblox_api.get_icons(session, match_ids)
-
+    universe_ids = list(universe_ids)
     results = []
-    for game in matches:
-        history_entry = update_history(game)  # also seeds history for brand-new games
-        votes = votes_by_id.get(game["id"])
-        score, breakdown = scoring.compute_score(game, votes, history_entry)
-        icon_url = icons_by_id.get(game["id"])
-        results.append((game, score, breakdown, votes, icon_url))
 
-    save_seen(seen_games)  # persist first-seen data collected this scan
-    results.sort(key=lambda r: r[1], reverse=True)
+    for i in range(0, len(universe_ids), 100):
+        chunk = universe_ids[i:i + 100]
+        data = await _fetch_json(
+            session,
+            STATS_URL,
+            params={"universeIds": ",".join(str(u) for u in chunk)},
+        )
+        if not data:
+            continue
+        results.extend(data.get("data", []))
+        await asyncio.sleep(0.3)
+
     return results
 
 
-async def post_result(destination, game, score, breakdown, votes, icon_url, prefix=None):
-    embed = build_embed(game, score, breakdown, votes, icon_url)
-    await destination.send(content=prefix, embed=embed, view=ScoutView())
+async def get_votes(session: aiohttp.ClientSession, universe_ids):
+    """
+    Returns { universeId: {"upVotes": int, "downVotes": int} }
+    """
+    universe_ids = list(universe_ids)
+    votes = {}
+
+    for i in range(0, len(universe_ids), 100):
+        chunk = universe_ids[i:i + 100]
+        data = await _fetch_json(
+            session,
+            VOTES_URL,
+            params={"universeIds": ",".join(str(u) for u in chunk)},
+        )
+        if not data:
+            continue
+        for entry in data.get("data", []):
+            votes[entry["id"]] = {
+                "upVotes": entry.get("upVotes", 0),
+                "downVotes": entry.get("downVotes", 0),
+            }
+        await asyncio.sleep(0.3)
+
+    return votes
 
 
-# ---------- events & commands ----------
+async def get_icons(session: aiohttp.ClientSession, universe_ids):
+    """
+    Returns { universeId: icon_image_url }
+    """
+    universe_ids = list(universe_ids)
+    icons = {}
 
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"Usage: `?{ctx.command.name} <min_ccu> <max_visits>`")
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send("Both values need to be whole numbers, e.g. `?setfilters 150 150000`")
-    else:
-        raise error
+    for i in range(0, len(universe_ids), 100):
+        chunk = universe_ids[i:i + 100]
+        data = await _fetch_json(
+            session,
+            ICONS_URL,
+            params={
+                "universeIds": ",".join(str(u) for u in chunk),
+                "size": "512x512",
+                "format": "Png",
+                "isCircular": "false",
+            },
+        )
+        if not data:
+            continue
+        for entry in data.get("data", []):
+            if entry.get("state") == "Completed":
+                icons[entry["targetId"]] = entry.get("imageUrl")
+        await asyncio.sleep(0.3)
 
-
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}")
-    if config.AUTO_SCAN_ENABLED and not auto_scan_loop.is_running():
-        auto_scan_loop.start()
-
-
-@bot.command(name="scan")
-async def scan(ctx, min_ccu: int = None, max_visits: int = None):
-    min_ccu = min_ccu if min_ccu is not None else current_min_ccu
-    max_visits = max_visits if max_visits is not None else current_max_visits
-
-    await ctx.send(f"Scanning for games with {min_ccu}+ CCU and under {max_visits:,} visits...")
-
-    results = await run_scan(min_ccu, max_visits, status_callback=ctx.send)
-
-    if not results:
-        await ctx.send("No matches found this scan. Try again later or widen your filters.")
-        return
-
-    for game, score, breakdown, votes, icon_url in results[:10]:
-        await post_result(ctx.channel, game, score, breakdown, votes, icon_url)
+    return icons
 
 
-@bot.command(name="setfilters")
-async def setfilters(ctx, min_ccu: int, max_visits: int):
-    global current_min_ccu, current_max_visits
-
-    if min_ccu < 0 or max_visits < 0:
-        await ctx.send("Both values need to be positive numbers.")
-        return
-
-    current_min_ccu = min_ccu
-    current_max_visits = max_visits
-    save_filters(current_min_ccu, current_max_visits)
-
-    await ctx.send(
-        f"Filters updated: **{min_ccu}+ CCU** and **under {max_visits:,} visits**. "
-        f"This applies to `?scan` (no args) and auto-scan going forward."
-    )
+def apply_filters(games, min_ccu, max_visits):
+    """
+    games: list of dicts as returned by get_stats()
+    Returns only games matching your scouting filters.
+    """
+    matches = []
+    for g in games:
+        playing = g.get("playing", 0)
+        visits = g.get("visits", 0)
+        if playing >= min_ccu and visits <= max_visits:
+            matches.append(g)
+    return matches
 
 
-@bot.command(name="filters")
-async def show_filters(ctx):
-    await ctx.send(
-        f"Current filters: **{current_min_ccu}+ CCU** and **under {current_max_visits:,} visits**"
-    )
-
-
-@tasks.loop(minutes=config.AUTO_SCAN_INTERVAL_MINUTES)
-async def auto_scan_loop():
-    alert_channel = bot.get_channel(config.ALERT_CHANNEL_ID)
-    priority_channel = bot.get_channel(config.PRIORITY_CHANNEL_ID)
-
-    if alert_channel is None:
-        print("ALERT_CHANNEL_ID not set or bot can't see that channel; skipping auto-scan post.")
-        return
-
-    results = await run_scan(current_min_ccu, current_max_visits)
-
-    for game, score, breakdown, votes, icon_url in results[:10]:
-        uid = str(game.get("id"))
-        if seen_games.get(uid, {}).get("alerted"):
-            continue  # already alerted on this one before
-
-        if score >= config.PRIORITY_SCORE_THRESHOLD and priority_channel is not None:
-            await post_result(priority_channel, game, score, breakdown, votes, icon_url,
-                               prefix="**\U0001F525 High-priority match**")
-        else:
-            await post_result(alert_channel, game, score, breakdown, votes, icon_url,
-                               prefix="**New scouting match**")
-
-        seen_games[uid]["alerted"] = True
-
-    save_seen(seen_games)
-
-
-if __name__ == "__main__":
-    bot.run(config.BOT_TOKEN)
+def game_url(game_stats_entry):
+    """
+    Build a clickable link from a get_stats() entry.
+    Roblox links use the *place* id, not the universe id -- the stats
+    endpoint returns this as "rootPlaceId".
+    """
+    place_id = game_stats_entry.get("rootPlaceId")
+    if place_id:
+        return f"https://www.roblox.com/games/{place_id}"
+    return "https://www.roblox.com/discover"
