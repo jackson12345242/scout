@@ -1,22 +1,27 @@
 """
 roblox_api.py
 
-Thin wrapper around Roblox's public HTTP endpoints.
+Thin wrapper around Roblox's public HTTP endpoints, routed through
+RoProxy (see note below).
 
-Two jobs:
-1. discover_candidates() -> a list of universeIds worth checking
-2. get_stats(universe_ids) -> live CCU / visits / favorites for those ids
+Jobs:
+1. discover_candidates() -> a list of universeIds worth checking,
+   combining keyword search with Roblox's Discover-page sort
+   categories (Popular, Trending, etc.) for wider coverage
+2. get_stats(universe_ids) -> live CCU / visits / favorites
+3. get_votes(universe_ids) -> upvotes/downvotes
+4. get_icons(universe_ids) -> game icon image URLs
 
 Notes on stability:
 - `games.roblox.com/v1/games?universeIds=...` (get_stats) is the well
-  documented, stable endpoint. It's safe to rely on.
-- Roblox does not offer an official "give me every game filtered by
-  CCU/visits" endpoint. Discovery is done by searching a rotating list
-  of keywords/genres via the public search API and collecting the
-  universeIds that come back. This is inherently a *sample*, not a full
-  crawl of Roblox -- it will miss games that don't match any seed term.
-  If Roblox changes this endpoint's shape, discover_candidates() is the
-  only function you should need to fix.
+  documented, stable endpoint.
+- The search and sorts/list endpoints are undocumented and can change
+  shape without notice. Rather than hardcode one exact nested path for
+  parsing them, we recursively extract any "universeId" values found
+  anywhere in the response (_extract_universe_ids) so a schema change
+  is less likely to silently break discovery.
+- There is no official "give me every game filtered by CCU/visits"
+  endpoint. This is always a sample of the platform, not a full crawl.
 """
 
 import asyncio
@@ -36,9 +41,11 @@ SEARCH_URL = "https://apis.roproxy.com/search-api/omni-search"
 STATS_URL = "https://games.roproxy.com/v1/games"
 VOTES_URL = "https://games.roproxy.com/v1/games/votes"
 ICONS_URL = "https://thumbnails.roproxy.com/v1/games/icons"
+SORTS_URL = "https://games.roproxy.com/v1/games/sorts"
+LIST_URL = "https://games.roproxy.com/v1/games/list"
 
-# Seed terms used to pull a spread of candidate games each scan.
-# Add/remove terms to change what kind of games you surface.
+# Seed terms used to pull a spread of candidate games each scan via
+# keyword search.
 SEED_TERMS = [
     "simulator", "tycoon", "obby", "roleplay", "horror",
     "anime", "fighting", "survival", "adventure", "clicker",
@@ -47,6 +54,29 @@ SEED_TERMS = [
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; RobloxScoutBot/1.0)"
 }
+
+
+def _extract_universe_ids(obj):
+    """
+    Recursively walk any nested dict/list JSON structure and collect
+    every integer value found under a "universeId" key, wherever it
+    appears. This is deliberately schema-agnostic: Roblox's discovery
+    and search endpoints are undocumented and reshape their response
+    structure over time, so rather than hardcode one exact nested path
+    (which breaks silently the moment the shape changes), we just
+    harvest the IDs from wherever they show up.
+    """
+    ids = set()
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key == "universeId" and isinstance(value, int):
+                ids.add(value)
+            else:
+                ids |= _extract_universe_ids(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            ids |= _extract_universe_ids(item)
+    return ids
 
 
 async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict, retries: int = 2):
@@ -68,10 +98,10 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict, re
     return None
 
 
-async def discover_candidates(session: aiohttp.ClientSession, terms=None, per_term_limit=20):
+async def discover_via_search(session, terms=None, per_term_limit=20):
     """
-    Search a set of seed terms and collect unique universeIds.
-    Returns a set of universeIds (ints).
+    Search a set of seed terms and collect unique universeIds using the
+    schema-agnostic extractor above.
     """
     terms = terms or SEED_TERMS
     universe_ids = set()
@@ -86,22 +116,69 @@ async def discover_candidates(session: aiohttp.ClientSession, terms=None, per_te
             print(f"[roblox_api] search for '{term}' returned no data")
             continue
 
-        found_this_term = 0
-        # The search API nests results under searchResults -> contents.
-        # We defensively walk the structure since Roblox can reshape this.
-        for block in data.get("searchResults", []):
-            for item in block.get("contents", [])[:per_term_limit]:
-                uid = item.get("universeId")
-                if uid:
-                    universe_ids.add(uid)
-                    found_this_term += 1
-
-        print(f"[roblox_api] search '{term}' -> {found_this_term} universeIds "
-              f"(raw keys: {list(data.keys())})")
+        found = _extract_universe_ids(data)
+        universe_ids |= found
+        print(f"[roblox_api] search '{term}' -> {len(found)} universeIds")
 
         await asyncio.sleep(0.5)  # be polite, avoid rate limiting
 
-    print(f"[roblox_api] discover_candidates total unique universeIds: {len(universe_ids)}")
+    return universe_ids
+
+
+async def discover_via_sorts(session, per_sort_limit=50):
+    """
+    Roblox's Discover page is built from named "sorts" (Popular,
+    Trending, Top Rated, etc.), each returning a batch of games. This
+    is a much wider net than keyword search -- typically dozens to a
+    few hundred games per sort -- so we pull from every sort we're
+    given rather than just one or two.
+    """
+    universe_ids = set()
+
+    sorts_data = await _fetch_json(session, SORTS_URL, params={"gameSetTypeId": 1})
+    if not sorts_data:
+        print("[roblox_api] sorts endpoint returned no data")
+        return universe_ids
+
+    sorts = sorts_data.get("sorts", [])
+    print(f"[roblox_api] found {len(sorts)} sort categories")
+
+    for sort in sorts:
+        token = sort.get("token")
+        name = sort.get("sortDisplayName") or sort.get("name") or "unknown"
+        if not token:
+            continue
+
+        list_data = await _fetch_json(
+            session, LIST_URL, params={"sortToken": token, "limit": per_sort_limit}
+        )
+        if not list_data:
+            print(f"[roblox_api] sort '{name}' returned no data")
+            continue
+
+        found = _extract_universe_ids(list_data)
+        print(f"[roblox_api] sort '{name}' -> {len(found)} universeIds")
+        universe_ids |= found
+
+        await asyncio.sleep(0.5)
+
+    return universe_ids
+
+
+async def discover_candidates(session, terms=None, per_term_limit=20):
+    """
+    Combines keyword search (genre/theme diversity) with sort-based
+    discovery (much larger batches from Roblox's own Discover page) to
+    cast as wide a net as we reasonably can. There is no public Roblox
+    endpoint that returns literally every game on the platform -- this
+    is the closest practical approximation.
+    """
+    search_ids = await discover_via_search(session, terms, per_term_limit)
+    sort_ids = await discover_via_sorts(session)
+
+    universe_ids = search_ids | sort_ids
+    print(f"[roblox_api] discover_candidates total unique universeIds: "
+          f"{len(universe_ids)} (search: {len(search_ids)}, sorts: {len(sort_ids)})")
     return universe_ids
 
 
