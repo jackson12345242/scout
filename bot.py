@@ -2,8 +2,12 @@
 Roblox Acquisition Scout Bot
 
 Commands:
-  ?scan            -> runs a scan now using config.py filters
-  ?scan 50 500000  -> one-off scan with custom min_ccu / max_visits
+  ?scan               -> runs a scan now using the current live filters
+  ?scan 50 500000     -> one-off scan with custom min_ccu / max_visits
+                          (doesn't change your saved filters)
+  ?setfilters 150 150000 -> updates the saved filters used by ?scan
+                             (no args) and by auto-scan
+  ?filters            -> shows the current saved filters
 
 Also runs a background loop every AUTO_SCAN_INTERVAL_MINUTES that posts
 new matches to ALERT_CHANNEL_ID, or PRIORITY_CHANNEL_ID if the computed
@@ -26,6 +30,27 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix=config.COMMAND_PREFIX, intents=intents)
+
+
+# ---------- persistence: live filters ----------
+
+FILTERS_FILE = "filters.json"
+
+
+def load_filters():
+    if os.path.exists(FILTERS_FILE):
+        with open(FILTERS_FILE, "r") as f:
+            data = json.load(f)
+            return data.get("min_ccu", config.MIN_CCU), data.get("max_visits", config.MAX_VISITS)
+    return config.MIN_CCU, config.MAX_VISITS
+
+
+def save_filters(min_ccu, max_visits):
+    with open(FILTERS_FILE, "w") as f:
+        json.dump({"min_ccu": min_ccu, "max_visits": max_visits}, f)
+
+
+current_min_ccu, current_max_visits = load_filters()
 
 
 # ---------- persistence: seen games + growth history ----------
@@ -214,6 +239,16 @@ async def post_result(destination, game, score, breakdown, votes, icon_url, pref
 # ---------- events & commands ----------
 
 @bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"Usage: `?{ctx.command.name} <min_ccu> <max_visits>`")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("Both values need to be whole numbers, e.g. `?setfilters 150 150000`")
+    else:
+        raise error
+
+
+@bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
     if config.AUTO_SCAN_ENABLED and not auto_scan_loop.is_running():
@@ -222,8 +257,8 @@ async def on_ready():
 
 @bot.command(name="scan")
 async def scan(ctx, min_ccu: int = None, max_visits: int = None):
-    min_ccu = min_ccu if min_ccu is not None else config.MIN_CCU
-    max_visits = max_visits if max_visits is not None else config.MAX_VISITS
+    min_ccu = min_ccu if min_ccu is not None else current_min_ccu
+    max_visits = max_visits if max_visits is not None else current_max_visits
 
     await ctx.send(f"Scanning for games with {min_ccu}+ CCU and under {max_visits:,} visits...")
 
@@ -237,6 +272,31 @@ async def scan(ctx, min_ccu: int = None, max_visits: int = None):
         await post_result(ctx.channel, game, score, breakdown, votes, icon_url)
 
 
+@bot.command(name="setfilters")
+async def setfilters(ctx, min_ccu: int, max_visits: int):
+    global current_min_ccu, current_max_visits
+
+    if min_ccu < 0 or max_visits < 0:
+        await ctx.send("Both values need to be positive numbers.")
+        return
+
+    current_min_ccu = min_ccu
+    current_max_visits = max_visits
+    save_filters(current_min_ccu, current_max_visits)
+
+    await ctx.send(
+        f"Filters updated: **{min_ccu}+ CCU** and **under {max_visits:,} visits**. "
+        f"This applies to `?scan` (no args) and auto-scan going forward."
+    )
+
+
+@bot.command(name="filters")
+async def show_filters(ctx):
+    await ctx.send(
+        f"Current filters: **{current_min_ccu}+ CCU** and **under {current_max_visits:,} visits**"
+    )
+
+
 @tasks.loop(minutes=config.AUTO_SCAN_INTERVAL_MINUTES)
 async def auto_scan_loop():
     alert_channel = bot.get_channel(config.ALERT_CHANNEL_ID)
@@ -246,7 +306,7 @@ async def auto_scan_loop():
         print("ALERT_CHANNEL_ID not set or bot can't see that channel; skipping auto-scan post.")
         return
 
-    results = await run_scan(config.MIN_CCU, config.MAX_VISITS)
+    results = await run_scan(current_min_ccu, current_max_visits)
 
     for game, score, breakdown, votes, icon_url in results[:10]:
         uid = str(game.get("id"))
