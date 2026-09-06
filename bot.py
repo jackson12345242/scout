@@ -166,15 +166,25 @@ class ScoutView(discord.ui.View):
 
 # ---------- scan logic ----------
 
-async def run_scan(min_ccu, max_visits):
+async def run_scan(min_ccu, max_visits, status_callback=None):
     """
     Returns a list of (game, score, breakdown, votes, icon_url) tuples,
     sorted by score descending.
+    status_callback: optional async function(str) to report progress,
+                      e.g. ctx.send, so diagnostics show up in Discord.
     """
     async with aiohttp.ClientSession() as session:
         candidate_ids = await roblox_api.discover_candidates(session)
+        if status_callback:
+            await status_callback(f"Found **{len(candidate_ids)}** candidate universeIds from search.")
+
         stats = await roblox_api.get_stats(session, candidate_ids)
+        if status_callback:
+            await status_callback(f"Pulled stats for **{len(stats)}** games.")
+
         matches = roblox_api.apply_filters(stats, min_ccu, max_visits)
+        if status_callback:
+            await status_callback(f"**{len(matches)}** passed your CCU/visits filters.")
 
         if not matches:
             return []
@@ -217,7 +227,7 @@ async def scan(ctx, min_ccu: int = None, max_visits: int = None):
 
     await ctx.send(f"Scanning for games with {min_ccu}+ CCU and under {max_visits:,} visits...")
 
-    results = await run_scan(min_ccu, max_visits)
+    results = await run_scan(min_ccu, max_visits, status_callback=ctx.send)
 
     if not results:
         await ctx.send("No matches found this scan. Try again later or widen your filters.")
