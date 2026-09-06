@@ -40,10 +40,16 @@ HEADERS = {
 
 
 async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict):
-    async with session.get(url, params=params, headers=HEADERS, timeout=15) as resp:
-        if resp.status != 200:
-            return None
-        return await resp.json()
+    try:
+        async with session.get(url, params=params, headers=HEADERS, timeout=15) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                print(f"[roblox_api] {url} returned {resp.status}: {body[:300]}")
+                return None
+            return await resp.json()
+    except Exception as e:
+        print(f"[roblox_api] request to {url} failed: {e!r}")
+        return None
 
 
 async def discover_candidates(session: aiohttp.ClientSession, terms=None, per_term_limit=20):
@@ -61,8 +67,10 @@ async def discover_candidates(session: aiohttp.ClientSession, terms=None, per_te
             params={"searchQuery": term, "pageType": "games"},
         )
         if not data:
+            print(f"[roblox_api] search for '{term}' returned no data")
             continue
 
+        found_this_term = 0
         # The search API nests results under searchResults -> contents.
         # We defensively walk the structure since Roblox can reshape this.
         for block in data.get("searchResults", []):
@@ -70,9 +78,14 @@ async def discover_candidates(session: aiohttp.ClientSession, terms=None, per_te
                 uid = item.get("universeId")
                 if uid:
                     universe_ids.add(uid)
+                    found_this_term += 1
+
+        print(f"[roblox_api] search '{term}' -> {found_this_term} universeIds "
+              f"(raw keys: {list(data.keys())})")
 
         await asyncio.sleep(0.5)  # be polite, avoid rate limiting
 
+    print(f"[roblox_api] discover_candidates total unique universeIds: {len(universe_ids)}")
     return universe_ids
 
 
