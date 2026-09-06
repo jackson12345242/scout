@@ -114,6 +114,18 @@ def _extract_universe_ids(obj):
     return ids
 
 
+class TooManyIdsError(Exception):
+    """
+    Raised when Roblox rejects a batched request for having too many
+    universeIds in one call (their error code 9). The real cap isn't
+    documented and appears to have gotten stricter than the 100/call
+    this file used to assume -- rather than hardcode a new guessed
+    number that can just as easily drift again, callers that batch IDs
+    catch this and retry with a smaller chunk (see _fetch_batched).
+    """
+    pass
+
+
 async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict, retries: int = 3):
     """
     retries defaults to 3 (was 2) with slightly longer, jittered
@@ -130,11 +142,19 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict, re
                     print(f"[roblox_api] {url} 429'd, backing off {backoff:.1f}s before retry {attempt + 1}")
                     await asyncio.sleep(backoff)
                     continue
+                if resp.status == 400:
+                    body = await resp.text()
+                    if '"code":9' in body or "Too many" in body:
+                        raise TooManyIdsError(body[:200])
+                    print(f"[roblox_api] {url} returned 400: {body[:300]}")
+                    return None
                 if resp.status != 200:
                     body = await resp.text()
                     print(f"[roblox_api] {url} returned {resp.status}: {body[:300]}")
                     return None
                 return await resp.json()
+        except TooManyIdsError:
+            raise
         except Exception as e:
             if attempt < retries:
                 backoff = 2 * (attempt + 1)
@@ -144,6 +164,52 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict, re
             print(f"[roblox_api] request to {url} failed: {e!r}")
             return None
     return None
+
+
+async def _fetch_batched(session, url, ids, static_params, id_param="universeIds", max_batch=100):
+    """
+    Fetches `ids` against `url` in batches, merging each batch's
+    "data" array into one list. If Roblox rejects a batch as having
+    too many IDs, the batch size is halved and that same slice is
+    retried -- so this self-corrects if Roblox's real limit changes
+    again, instead of us hardcoding a fresh guess each time it does.
+
+    Returns (entries, failed_chunk_count).
+    """
+    ids = list(ids)
+    results = []
+    failed = 0
+    i = 0
+    batch_size = max_batch
+
+    while i < len(ids):
+        chunk = ids[i:i + batch_size]
+        params = dict(static_params)
+        params[id_param] = ",".join(str(u) for u in chunk)
+
+        try:
+            data = await _fetch_json(session, url, params)
+        except TooManyIdsError:
+            if batch_size == 1:
+                print(f"[roblox_api] {url} rejected even a single id as 'too many'; skipping id {chunk}")
+                failed += 1
+                i += 1
+                continue
+            batch_size = max(1, batch_size // 2)
+            print(f"[roblox_api] {url} batch of {len(chunk)} rejected as too many, retrying with batch size {batch_size}")
+            continue  # retry same starting index i with the smaller batch_size
+
+        if data is None:
+            failed += 1
+            i += batch_size
+            await asyncio.sleep(0.3)
+            continue
+
+        results.extend(data.get("data", []))
+        i += batch_size
+        await asyncio.sleep(0.3)
+
+    return results, failed
 
 
 async def discover_via_search(session, terms=None, per_term_limit=20):
@@ -254,58 +320,29 @@ async def get_stats(session: aiohttp.ClientSession, universe_ids):
     """
     Given an iterable of universeIds, return a list of dicts:
     { id, name, playing, visits, favoritedCount, created, updated }
-    Roblox allows batching multiple ids in one call (comma separated),
-    capped conservatively at 100 per request here.
 
     Returns a (results, failed_chunks) tuple -- failed_chunks is how
-    many of the batch requests came back empty after retries, so
+    many of the batch requests came back empty after retries (network
+    errors, exhausted 429 retries -- NOT the "too many ids" case, which
+    is handled transparently by shrinking the batch instead), so
     callers can tell "0 stats because nothing matched" apart from
     "0 stats because RoProxy dropped every request." Those look
     identical if you only look at len(results).
     """
-    universe_ids = list(universe_ids)
-    results = []
-    failed_chunks = 0
-
-    for i in range(0, len(universe_ids), 100):
-        chunk = universe_ids[i:i + 100]
-        data = await _fetch_json(
-            session,
-            STATS_URL,
-            params={"universeIds": ",".join(str(u) for u in chunk)},
-        )
-        if not data:
-            failed_chunks += 1
-            continue
-        results.extend(data.get("data", []))
-        await asyncio.sleep(0.3)
-
-    return results, failed_chunks
+    return await _fetch_batched(session, STATS_URL, universe_ids, {})
 
 
 async def get_votes(session: aiohttp.ClientSession, universe_ids):
     """
     Returns { universeId: {"upVotes": int, "downVotes": int} }
     """
-    universe_ids = list(universe_ids)
+    entries, _failed = await _fetch_batched(session, VOTES_URL, universe_ids, {})
     votes = {}
-
-    for i in range(0, len(universe_ids), 100):
-        chunk = universe_ids[i:i + 100]
-        data = await _fetch_json(
-            session,
-            VOTES_URL,
-            params={"universeIds": ",".join(str(u) for u in chunk)},
-        )
-        if not data:
-            continue
-        for entry in data.get("data", []):
-            votes[entry["id"]] = {
-                "upVotes": entry.get("upVotes", 0),
-                "downVotes": entry.get("downVotes", 0),
-            }
-        await asyncio.sleep(0.3)
-
+    for entry in entries:
+        votes[entry["id"]] = {
+            "upVotes": entry.get("upVotes", 0),
+            "downVotes": entry.get("downVotes", 0),
+        }
     return votes
 
 
@@ -313,28 +350,16 @@ async def get_icons(session: aiohttp.ClientSession, universe_ids):
     """
     Returns { universeId: icon_image_url }
     """
-    universe_ids = list(universe_ids)
+    entries, _failed = await _fetch_batched(
+        session,
+        ICONS_URL,
+        universe_ids,
+        {"size": "512x512", "format": "Png", "isCircular": "false"},
+    )
     icons = {}
-
-    for i in range(0, len(universe_ids), 100):
-        chunk = universe_ids[i:i + 100]
-        data = await _fetch_json(
-            session,
-            ICONS_URL,
-            params={
-                "universeIds": ",".join(str(u) for u in chunk),
-                "size": "512x512",
-                "format": "Png",
-                "isCircular": "false",
-            },
-        )
-        if not data:
-            continue
-        for entry in data.get("data", []):
-            if entry.get("state") == "Completed":
-                icons[entry["targetId"]] = entry.get("imageUrl")
-        await asyncio.sleep(0.3)
-
+    for entry in entries:
+        if entry.get("state") == "Completed":
+            icons[entry["targetId"]] = entry.get("imageUrl")
     return icons
 
 
