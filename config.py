@@ -11,6 +11,11 @@ ALERT_CHANNEL_ID = int(os.environ.get("ALERT_CHANNEL_ID", "0"))
 # posted instead of the regular channel.
 PRIORITY_CHANNEL_ID = int(os.environ.get("PRIORITY_CHANNEL_ID", "0"))
 
+# Channel ID where unhandled errors (command errors, auto-scan crashes)
+# get posted as a traceback embed, so problems surface in Discord
+# instead of only showing up in the process logs.
+ERROR_CHANNEL_ID = int(os.environ.get("ERROR_CHANNEL_ID", "1546210133665783858"))
+
 # --- Scouting filters ---
 MIN_CCU = 100          # minimum concurrent players
 MAX_VISITS = 200_000    # maximum total visits (keeps it "undiscovered")
@@ -37,7 +42,8 @@ SCORE_GROWTH_REFERENCE = 1.0       # 100% CCU growth since first-seen scores ful
 
 # --- Auto-scan behavior ---
 AUTO_SCAN_ENABLED = True
-AUTO_SCAN_INTERVAL_MINUTES = 30
+AUTO_SCAN_INTERVAL_MINUTES = 5   # was 30 -- now scans every 5 minutes
+AUTO_SCAN_POST_LIMIT = 3         # was implicitly 10 -- now posts top 3 per run
 
 # File used to remember games we've seen before (for dedup + growth
 # tracking). NOTE: on Railway this resets on every redeploy unless you
