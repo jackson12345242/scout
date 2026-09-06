@@ -19,6 +19,7 @@ through) get posted as a traceback embed to ERROR_CHANNEL_ID so they
 show up in Discord instead of only in process logs.
 """
 
+import asyncio
 import json
 import os
 import traceback
@@ -74,6 +75,15 @@ def save_seen(seen):
 
 
 seen_games = load_seen()  # { "universeId(str)": {"first_playing": int, "first_seen_iso": str, "alerted": bool} }
+
+# A full scan now does real search + sort coverage and can take a
+# while, especially with 429 backoffs. Without this lock, a manual
+# ?scan overlapping with the auto-scan loop (or the loop firing again
+# before a slow previous run finished) causes two scans to run at once
+# -- doubling request load against RoProxy and interleaving their
+# console output, which is what the duplicated "found N sort
+# categories" log lines were.
+scan_lock = asyncio.Lock()
 
 
 def update_history(game):
@@ -316,10 +326,18 @@ async def scan(ctx, min_ccu: int = None, max_visits: int = None):
     min_ccu = min_ccu if min_ccu is not None else current_min_ccu
     max_visits = max_visits if max_visits is not None else current_max_visits
 
+    if scan_lock.locked():
+        await ctx.send(
+            "A scan is already running (manual or auto) -- wait for it to finish before starting another. "
+            "Use `?poll` to see when the next auto-scan is due."
+        )
+        return
+
     await ctx.send(f"Scanning for games with {min_ccu}+ CCU and under {max_visits:,} visits...")
 
     try:
-        results = await run_scan(min_ccu, max_visits, status_callback=ctx.send)
+        async with scan_lock:
+            results = await run_scan(min_ccu, max_visits, status_callback=ctx.send)
     except Exception as e:
         await ctx.send("\u26A0\uFE0F Scan failed partway through -- I've logged the error.")
         await report_error("`?scan` command", e)
@@ -382,11 +400,19 @@ async def poll(ctx):
 
 @tasks.loop(minutes=config.AUTO_SCAN_INTERVAL_MINUTES)
 async def auto_scan_loop():
+    # If a manual ?scan (or a slow previous auto-scan) is still running,
+    # skip this tick rather than starting a second scan on top of it --
+    # see scan_lock's comment above for why that matters.
+    if scan_lock.locked():
+        print("[auto_scan_loop] skipping this run -- a scan is already in progress")
+        return
+
     # Wrapped in try/except so one bad run (network blip, RoProxy
     # outage, etc.) doesn't silently kill the whole loop -- it just
     # reports the error and waits for the next scheduled interval.
     try:
-        await _run_auto_scan()
+        async with scan_lock:
+            await _run_auto_scan()
     except Exception as e:
         await report_error("auto_scan_loop", e)
 
