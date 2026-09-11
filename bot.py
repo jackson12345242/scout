@@ -166,7 +166,10 @@ def build_embed(game, score, breakdown, votes, icon_url, social=None):
     total_votes = up + down
     like_ratio = (up / total_votes * 100) if total_votes else 0
 
-    tag = "\U0001F195 Early Discovery!" if _is_new(created) else "\U0001F4C8 Scouting Match"
+    if game.get("_is_closest_fill"):
+        tag = "\U0001F50D Closest Match (didn't fully clear your filters)"
+    else:
+        tag = "\U0001F195 Early Discovery!" if _is_new(created) else "\U0001F4C8 Scouting Match"
 
     embed = discord.Embed(
         title=game.get("name", "Unknown game"),
@@ -174,6 +177,10 @@ def build_embed(game, score, breakdown, votes, icon_url, social=None):
         description=f"**{tag}**",
         color=score_color(score),
     )
+
+    gap_note = game.get("_gap_note")
+    if gap_note:
+        embed.add_field(name="\U0001F4CF Filter Gap", value=gap_note, inline=False)
     if icon_url:
         embed.set_thumbnail(url=icon_url)
 
@@ -260,10 +267,35 @@ class ScoutView(discord.ui.View):
 
 # ---------- scan logic ----------
 
-async def run_scan(min_ccu, max_visits, status_callback=None):
+def _annotate_gap(game, min_ccu, max_visits):
+    """
+    Builds a short human-readable note on why a "closest match" fill-in
+    didn't strictly pass the filters, e.g. "42 CCU (need 100+)" or
+    "310,000 visits (need under 200,000)". Stored on the game dict so
+    build_embed can show it without needing the raw thresholds passed
+    around separately.
+    """
+    playing = game.get("playing", 0)
+    visits = game.get("visits", 0)
+    parts = []
+    if playing < min_ccu:
+        parts.append(f"{playing:,} CCU (need {min_ccu:,}+)")
+    if visits > max_visits:
+        parts.append(f"{visits:,} visits (need under {max_visits:,})")
+    game["_gap_note"] = " \u2022 ".join(parts) if parts else None
+
+
+async def run_scan(min_ccu, max_visits, status_callback=None, ensure_minimum=3):
     """
     Returns a list of (game, score, breakdown, votes, icon_url, social)
-    tuples, sorted by score descending.
+    tuples. Real filter-passing games are always ranked first (best
+    score first); if fewer than `ensure_minimum` games strictly pass,
+    the list is padded out with the closest non-passing candidates
+    (ranked by roblox_api.rank_by_closeness) so there's still something
+    to look at instead of an empty scan. Fill-ins are tagged with
+    game["_is_closest_fill"] = True and a game["_gap_note"] explaining
+    what they missed by, so the embed can be upfront about it instead
+    of presenting them as if they'd actually passed.
     status_callback: optional async function(str) to report progress,
                       e.g. ctx.send, so diagnostics show up in Discord.
     """
@@ -283,21 +315,42 @@ async def run_scan(min_ccu, max_visits, status_callback=None):
                 note = f" ({failed_chunks} batch request(s) failed after retries -- likely rate-limited, not a real 0)"
             await status_callback(f"Pulled stats for **{len(stats)}** games{note}.")
 
-        matches = roblox_api.apply_filters(stats, min_ccu, max_visits)
-        print(f"[scan] {len(matches)} passed filters (min_ccu={min_ccu}, max_visits={max_visits}).")
+        strict_matches = roblox_api.apply_filters(stats, min_ccu, max_visits)
+        print(f"[scan] {len(strict_matches)} passed filters (min_ccu={min_ccu}, max_visits={max_visits}).")
         if status_callback:
-            await status_callback(f"**{len(matches)}** passed your CCU/visits filters.")
+            await status_callback(f"**{len(strict_matches)}** passed your CCU/visits filters.")
 
-        if not matches:
+        selected = list(strict_matches)
+        for g in selected:
+            g["_is_closest_fill"] = False
+            g["_gap_note"] = None
+
+        if len(selected) < ensure_minimum:
+            strict_ids = {g["id"] for g in strict_matches}
+            remaining_pool = [g for g in stats if g["id"] not in strict_ids]
+            needed = ensure_minimum - len(selected)
+            filler = roblox_api.rank_by_closeness(remaining_pool, min_ccu, max_visits)[:needed]
+            for g in filler:
+                g["_is_closest_fill"] = True
+                _annotate_gap(g, min_ccu, max_visits)
+            print(f"[scan] backfilled {len(filler)} closest-match game(s) since strict matches came up short.")
+            if status_callback and filler:
+                await status_callback(
+                    f"Only **{len(strict_matches)}** strictly passed, so adding **{len(filler)}** "
+                    f"closest-match game(s) to round it out."
+                )
+            selected.extend(filler)
+
+        if not selected:
             return []
 
-        match_ids = [g["id"] for g in matches]
-        votes_by_id = await roblox_api.get_votes(session, match_ids)
-        icons_by_id = await roblox_api.get_icons(session, match_ids)
-        social_by_id = await roblox_api.get_social_links(session, match_ids)
+        selected_ids = [g["id"] for g in selected]
+        votes_by_id = await roblox_api.get_votes(session, selected_ids)
+        icons_by_id = await roblox_api.get_icons(session, selected_ids)
+        social_by_id = await roblox_api.get_social_links(session, selected_ids)
 
     results = []
-    for game in matches:
+    for game in selected:
         history_entry = update_history(game)  # also seeds history for brand-new games
         votes = votes_by_id.get(game["id"])
         score, breakdown = scoring.compute_score(game, votes, history_entry)
@@ -306,7 +359,9 @@ async def run_scan(min_ccu, max_visits, status_callback=None):
         results.append((game, score, breakdown, votes, icon_url, social))
 
     save_seen(seen_games)  # persist first-seen data collected this scan
-    results.sort(key=lambda r: r[1], reverse=True)
+    # Real matches always rank above closest-match fill-ins, regardless
+    # of score; within each group, highest score first.
+    results.sort(key=lambda r: (not r[0]["_is_closest_fill"], r[1]), reverse=True)
     return results
 
 
@@ -386,14 +441,17 @@ async def scan(ctx, min_ccu: int = None, max_visits: int = None):
 
     try:
         async with scan_lock:
-            results = await run_scan(min_ccu, max_visits, status_callback=ctx.send)
+            results = await run_scan(min_ccu, max_visits, status_callback=ctx.send, ensure_minimum=3)
     except Exception as e:
         await ctx.send("\u26A0\uFE0F Scan failed partway through -- I've logged the error.")
         await report_error("`?scan` command", e)
         return
 
     if not results:
-        await ctx.send("No matches found this scan. Try again later or widen your filters.")
+        # Only possible now if discovery itself came back with zero
+        # games at all (e.g. RoProxy down) -- ensure_minimum guarantees
+        # a result otherwise, even if every one is a closest-match fill-in.
+        await ctx.send("No games came back from Roblox at all this scan -- likely a RoProxy outage. Try again shortly.")
         return
 
     for game, score, breakdown, votes, icon_url, social in results[:10]:
@@ -496,8 +554,10 @@ async def _run_auto_scan():
               f"can't see that channel; skipping auto-scan post entirely this cycle.")
         return
 
-    results = await run_scan(current_min_ccu, current_max_visits)
-    print(f"[auto_scan_loop] {len(results)} total matches this cycle.")
+    results = await run_scan(current_min_ccu, current_max_visits, ensure_minimum=config.AUTO_SCAN_POST_LIMIT)
+    strict_count = sum(1 for r in results if not r[0]["_is_closest_fill"])
+    print(f"[auto_scan_loop] {len(results)} total ({strict_count} strict, "
+          f"{len(results) - strict_count} closest-match fill-ins) this cycle.")
 
     posted = 0
     already_alerted = 0
