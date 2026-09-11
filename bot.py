@@ -9,6 +9,8 @@ Commands:
                              (no args) and by auto-scan
   ?filters            -> shows the current saved filters
   ?poll               -> shows when the next auto-scan will run
+  ?instapoll          -> forces an immediate scan cycle right now
+                          (restricted to INSTAPOLL_ROLE_ID)
 
 Also runs a background loop every AUTO_SCAN_INTERVAL_MINUTES that posts
 the top AUTO_SCAN_POST_LIMIT new matches to ALERT_CHANNEL_ID, or
@@ -308,6 +310,12 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.BadArgument):
         await ctx.send("Both values need to be whole numbers, e.g. `?setfilters 150 150000`")
         return
+    if isinstance(error, commands.MissingRole):
+        await ctx.send("You don't have the required role to use that command.")
+        return
+    if isinstance(error, commands.NoPrivateMessage):
+        await ctx.send("That command only works in a server, not in DMs.")
+        return
 
     original = getattr(error, "original", error)
     await ctx.send(f"\u26A0\uFE0F Something went wrong running that command -- I've logged the error.")
@@ -396,6 +404,37 @@ async def poll(ctx):
         f"Next auto-scan: <t:{ts}:R> (<t:{ts}:T>) -- posting top **{config.AUTO_SCAN_POST_LIMIT}** "
         f"matches every **{config.AUTO_SCAN_INTERVAL_MINUTES}** minutes."
     )
+
+
+@bot.command(name="instapoll")
+@commands.has_role(config.INSTAPOLL_ROLE_ID)
+async def instapoll(ctx):
+    """
+    Forces an immediate scan cycle right now, using the same posting
+    logic as the scheduled auto-scan (top AUTO_SCAN_POST_LIMIT matches
+    to ALERT_CHANNEL_ID / PRIORITY_CHANNEL_ID). Restricted to
+    INSTAPOLL_ROLE_ID. Doesn't touch the auto-scan loop's own timer --
+    the next regularly scheduled auto-scan still happens on its normal
+    5-minute cadence, this just runs an extra one on demand.
+    """
+    if scan_lock.locked():
+        await ctx.send(
+            "A scan is already running -- wait for it to finish before triggering another. "
+            "Use `?poll` to check status."
+        )
+        return
+
+    await ctx.send("Running an instant scan now...")
+
+    try:
+        async with scan_lock:
+            await _run_auto_scan()
+    except Exception as e:
+        await ctx.send("\u26A0\uFE0F Instant scan failed partway through -- I've logged the error.")
+        await report_error("`?instapoll` command", e)
+        return
+
+    await ctx.send("Instant scan complete.")
 
 
 @tasks.loop(minutes=config.AUTO_SCAN_INTERVAL_MINUTES)
