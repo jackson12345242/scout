@@ -45,6 +45,10 @@ AUTO_SCAN_ENABLED = True
 AUTO_SCAN_INTERVAL_MINUTES = 5   # was 30 -- now scans every 5 minutes
 AUTO_SCAN_POST_LIMIT = 3         # was implicitly 10 -- now posts top 3 per run
 
+# Only members with this role can use ?instapoll (force an immediate
+# scan cycle instead of waiting for the next scheduled auto-scan).
+INSTAPOLL_ROLE_ID = int(os.environ.get("INSTAPOLL_ROLE_ID", "1546134163030020177"))
+
 # File used to remember games we've seen before (for dedup + growth
 # tracking). NOTE: on Railway this resets on every redeploy unless you
 # attach a persistent volume -- see README.
