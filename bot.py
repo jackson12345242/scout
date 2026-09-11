@@ -25,6 +25,7 @@ show up in Discord instead of only in process logs.
 import asyncio
 import json
 import os
+import sys
 import traceback
 from datetime import datetime, timezone
 
@@ -35,6 +36,16 @@ from discord.ext import commands, tasks
 import config
 import roblox_api
 import scoring
+
+# Force line-buffered stdout. Without this, print() output can sit in
+# a buffer for a long time when it's piped to a log viewer (Docker /
+# Railway / Heroku logs aren't a real TTY), which makes a perfectly
+# healthy process look "stuck" -- the diagnostic prints below are
+# useless if they don't actually show up when they happen. This is
+# equivalent to running `python -u`, but doesn't depend on the
+# Procfile/start command being set up right.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -258,10 +269,14 @@ async def run_scan(min_ccu, max_visits, status_callback=None):
     """
     async with aiohttp.ClientSession() as session:
         candidate_ids = await roblox_api.discover_candidates(session)
+        msg = f"Found {len(candidate_ids)} candidate universeIds from search."
+        print(f"[scan] {msg}")
         if status_callback:
             await status_callback(f"Found **{len(candidate_ids)}** candidate universeIds from search.")
 
         stats, failed_chunks = await roblox_api.get_stats(session, candidate_ids)
+        msg = f"Pulled stats for {len(stats)} games ({failed_chunks} failed chunk(s))."
+        print(f"[scan] {msg}")
         if status_callback:
             note = ""
             if failed_chunks:
@@ -269,6 +284,7 @@ async def run_scan(min_ccu, max_visits, status_callback=None):
             await status_callback(f"Pulled stats for **{len(stats)}** games{note}.")
 
         matches = roblox_api.apply_filters(stats, min_ccu, max_visits)
+        print(f"[scan] {len(matches)} passed filters (min_ccu={min_ccu}, max_visits={max_visits}).")
         if status_callback:
             await status_callback(f"**{len(matches)}** passed your CCU/visits filters.")
 
@@ -323,9 +339,33 @@ async def on_command_error(ctx, error):
     await report_error(f"command `?{ctx.command}`", original)
 
 
+def _check_channel(name, channel_id):
+    """
+    Startup sanity check. A misconfigured or unreachable channel ID is
+    the single most common reason auto-scan looks like it 'does
+    nothing' -- _run_auto_scan currently just prints and silently
+    returns in that case, which is easy to miss. Surfacing it loudly
+    at startup means you find out immediately instead of after
+    watching several silent scan cycles go by.
+    """
+    if channel_id == 0:
+        print(f"[startup][WARNING] {name} is not set (env var missing) -- auto-scan posts to this channel will be skipped.")
+        return
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        print(f"[startup][WARNING] {name}={channel_id} -- bot cannot see this channel "
+              f"(wrong ID, or bot not added to that server/channel). Posts to it will silently fail.")
+    else:
+        print(f"[startup] {name}={channel_id} -> #{channel.name} OK")
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
+    _check_channel("ALERT_CHANNEL_ID", config.ALERT_CHANNEL_ID)
+    _check_channel("PRIORITY_CHANNEL_ID", config.PRIORITY_CHANNEL_ID)
+    _check_channel("ERROR_CHANNEL_ID", config.ERROR_CHANNEL_ID)
+    print(f"[startup] Current filters: min_ccu={current_min_ccu}, max_visits={current_max_visits}")
     if config.AUTO_SCAN_ENABLED and not auto_scan_loop.is_running():
         auto_scan_loop.start()
 
@@ -446,22 +486,28 @@ async def auto_scan_loop():
 
 
 async def _run_auto_scan():
+    print(f"[auto_scan_loop] starting run (filters: min_ccu={current_min_ccu}, max_visits={current_max_visits})")
+
     alert_channel = bot.get_channel(config.ALERT_CHANNEL_ID)
     priority_channel = bot.get_channel(config.PRIORITY_CHANNEL_ID)
 
     if alert_channel is None:
-        print("ALERT_CHANNEL_ID not set or bot can't see that channel; skipping auto-scan post.")
+        print(f"[auto_scan_loop][WARNING] ALERT_CHANNEL_ID={config.ALERT_CHANNEL_ID} not set or bot "
+              f"can't see that channel; skipping auto-scan post entirely this cycle.")
         return
 
     results = await run_scan(current_min_ccu, current_max_visits)
+    print(f"[auto_scan_loop] {len(results)} total matches this cycle.")
 
     posted = 0
+    already_alerted = 0
     for game, score, breakdown, votes, icon_url, social in results:
         if posted >= config.AUTO_SCAN_POST_LIMIT:
             break
 
         uid = str(game.get("id"))
         if seen_games.get(uid, {}).get("alerted"):
+            already_alerted += 1
             continue  # already alerted on this one before
 
         if score >= config.PRIORITY_SCORE_THRESHOLD and priority_channel is not None:
@@ -473,6 +519,9 @@ async def _run_auto_scan():
 
         seen_games[uid]["alerted"] = True
         posted += 1
+
+    print(f"[auto_scan_loop] posted {posted}, skipped {already_alerted} already-alerted "
+          f"(out of {len(results)} matches).")
 
     save_seen(seen_games)
 
