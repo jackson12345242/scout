@@ -104,9 +104,18 @@ HEADERS = {
 # after this change.
 DELAY_BETWEEN_SEARCH_TERMS = 1.2
 DELAY_BETWEEN_SORTS = 1.2
-DELAY_BETWEEN_BATCH_CHUNKS = 1.5
-COOLDOWN_AFTER_DISCOVERY = 3.0  # pause before hammering stats endpoints right after a discovery burst
-DEFAULT_BATCH_SIZE = 40          # start smaller than Roblox's old ~100 cap; less concentrated load per call
+DELAY_BETWEEN_BATCH_CHUNKS = 2.5   # was 1.5 -- stats calls were still 429ing on the very first attempt
+COOLDOWN_AFTER_DISCOVERY = 8.0     # was 3.0 -- give RoProxy's bucket more time to recover before the stats burst
+DEFAULT_BATCH_SIZE = 40            # confirmed OK -- no more "too many ids" errors at this size
+
+# How many candidates discovery pulls in per cycle. Every candidate
+# costs a stats lookup, and stats lookups are what's hitting RoProxy's
+# rate limit -- cutting this in roughly half (from ~600 to ~300)
+# noticeably improves the odds a scan actually finishes getting stats
+# back instead of losing most chunks to 429s. You'll cover less of the
+# platform per scan, but every 5 minutes adds up.
+DEFAULT_PER_SORT_LIMIT = 25   # was 50
+SEARCH_TERM_LIMIT = 6          # was implicitly all 10 terms every cycle
 
 
 def _extract_universe_ids(obj):
@@ -235,12 +244,27 @@ async def _fetch_batched(session, url, ids, static_params, id_param="universeIds
     return results, failed
 
 
+_search_term_cursor = 0
+
+
 async def discover_via_search(session, terms=None, per_term_limit=20):
     """
-    Search a set of seed terms and collect unique universeIds using the
-    schema-agnostic extractor above.
+    Search a rotating slice of SEARCH_TERM_LIMIT seed terms and collect
+    unique universeIds using the schema-agnostic extractor above.
+    Rotates through the full SEED_TERMS list across successive calls
+    (via _search_term_cursor) rather than always hitting the same
+    subset, so every term still gets used over a few cycles -- just
+    fewer terms per single cycle, to cut request volume.
     """
-    terms = terms or SEED_TERMS
+    global _search_term_cursor
+    pool = terms or SEED_TERMS
+    if len(pool) > SEARCH_TERM_LIMIT:
+        start = _search_term_cursor % len(pool)
+        selected = [pool[(start + i) % len(pool)] for i in range(SEARCH_TERM_LIMIT)]
+        _search_term_cursor = (start + SEARCH_TERM_LIMIT) % len(pool)
+    else:
+        selected = pool
+    terms = selected
     universe_ids = set()
 
     for term in terms:
@@ -266,7 +290,7 @@ async def discover_via_search(session, terms=None, per_term_limit=20):
     return universe_ids
 
 
-async def discover_via_sorts(session, per_sort_limit=50):
+async def discover_via_sorts(session, per_sort_limit=DEFAULT_PER_SORT_LIMIT):
     """
     Roblox's Discover page is built from named "sorts" (Popular,
     Trending, Top Rated, etc.), each returning a batch of games. This
@@ -425,6 +449,8 @@ async def get_social_links(session: aiohttp.ClientSession, universe_ids, concurr
             await asyncio.sleep(0.4)
 
     await asyncio.gather(*(fetch_one(uid) for uid in universe_ids))
+    found = sum(1 for v in results.values() if v.get("discord"))
+    print(f"[roblox_api] get_social_links: {found}/{len(universe_ids)} games have a linked Discord")
     return results
 
 
@@ -444,11 +470,12 @@ def apply_filters(games, min_ccu, max_visits):
 
 def game_url(game_stats_entry):
     """
-    Build a clickable link from a get_stats() entry.
-    Roblox links use the *place* id, not the universe id -- the stats
-    endpoint returns this as "rootPlaceId".
+    Link destination for the embed title. Previously linked to the
+    game's own Roblox page; now points to the CreatorExchange search
+    page instead (per request) -- this is a static URL, not deep-linked
+    to the specific game, since CreatorExchange doesn't expose a
+    per-listing query-param format we could target. If you want it to
+    prefill a search for this game, let me know what CreatorExchange's
+    search URL looks like with a query in it and I'll wire that up.
     """
-    place_id = game_stats_entry.get("rootPlaceId")
-    if place_id:
-        return f"https://www.roblox.com/games/{place_id}"
-    return "https://www.roblox.com/discover"
+    return "https://creatorexchange.io/search"
