@@ -373,7 +373,10 @@ async def discover_candidates(session, terms=None, per_term_limit=20):
 async def get_stats(session: aiohttp.ClientSession, universe_ids):
     """
     Given an iterable of universeIds, return a list of dicts:
-    { id, name, playing, visits, favoritedCount, created, updated }
+    { id, name, playing, visits, favoritedCount, created, updated,
+      rootPlaceId, ... } -- rootPlaceId is what game_url() below needs
+    to build a real, clickable Roblox game page link (Roblox's game
+    pages are keyed by placeId, not universeId).
 
     Returns a (results, failed_chunks) tuple -- failed_chunks is how
     many of the batch requests came back empty after retries (network
@@ -468,14 +471,53 @@ def apply_filters(games, min_ccu, max_visits):
     return matches
 
 
+def closeness_score(game, min_ccu, max_visits):
+    """
+    0 means the game actually passes both filters. Anything above 0
+    measures how far it missed by, as a fraction of the threshold --
+    e.g. 0.2 on the CCU side means it had 20% fewer players than
+    min_ccu required. Used only as a fallback ranking for games that
+    didn't strictly pass, so we can still surface "closest" candidates
+    when nothing clears the bar outright (see rank_by_closeness).
+    """
+    playing = game.get("playing", 0)
+    visits = max(game.get("visits", 0), 0)
+
+    ccu_gap = max(0.0, (min_ccu - playing) / min_ccu) if min_ccu > 0 else 0.0
+    visits_gap = max(0.0, (visits - max_visits) / max_visits) if max_visits > 0 else 0.0
+
+    return ccu_gap + visits_gap
+
+
+def rank_by_closeness(games, min_ccu, max_visits):
+    """
+    Sorts games (that did NOT pass apply_filters) by how close they
+    came to passing, best (smallest gap) first.
+    """
+    return sorted(games, key=lambda g: closeness_score(g, min_ccu, max_visits))
+
+
 def game_url(game_stats_entry):
     """
-    Link destination for the embed title. Previously linked to the
-    game's own Roblox page; now points to the CreatorExchange search
-    page instead (per request) -- this is a static URL, not deep-linked
-    to the specific game, since CreatorExchange doesn't expose a
-    per-listing query-param format we could target. If you want it to
-    prefill a search for this game, let me know what CreatorExchange's
-    search URL looks like with a query in it and I'll wire that up.
+    Link destination for the embed title -- the actual Roblox game
+    page, e.g. https://www.roblox.com/games/1234567/Some-Game-Name
+
+    Roblox game pages are keyed by *placeId*, not universeId, even
+    though our stats entries are indexed by universeId. The
+    games.roblox.com/v1/games (get_stats) response includes
+    "rootPlaceId" for exactly this reason, so we use that. The name
+    slug in the URL is cosmetic -- Roblox resolves the link correctly
+    even with a generic or missing slug, so we don't need to worry
+    about exact slugification matching Roblox's own.
     """
-    return "https://creatorexchange.io/search"
+    place_id = game_stats_entry.get("rootPlaceId")
+    if not place_id:
+        # Fall back to a search link if we somehow don't have a
+        # rootPlaceId for this entry, so the link still goes somewhere
+        # useful instead of 404ing.
+        name = game_stats_entry.get("name", "")
+        return f"https://www.roblox.com/search/games?keyword={name}".replace(" ", "%20")
+
+    name = game_stats_entry.get("name", "game")
+    slug = "-".join(name.split())
+    return f"https://www.roblox.com/games/{place_id}/{slug}"
