@@ -204,12 +204,11 @@ def build_embed(game, score, breakdown, votes, icon_url, social=None):
         inline=True,
     )
 
-    discord_url = social.get("discord") if social else None
-    embed.add_field(
-        name="\U0001F4AC Discord",
-        value=f"[Server linked]({discord_url})" if discord_url else "Not linked",
-        inline=True,
-    )
+    # Discord field removed: get_social_links() is a permanent no-op
+    # (the underlying Roblox endpoint 401s without a real authenticated
+    # account session -- see its docstring in roblox_api.py) so this
+    # would only ever say "Not linked" regardless of the truth, which
+    # is worse than not showing it at all.
 
     embed.add_field(
         name="\U0001F3F7\uFE0F Metadata",
