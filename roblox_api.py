@@ -11,7 +11,8 @@ Jobs:
 2. get_stats(universe_ids) -> live CCU / visits / favorites
 3. get_votes(universe_ids) -> upvotes/downvotes
 4. get_icons(universe_ids) -> game icon image URLs
-5. get_social_links(universe_ids) -> attached social links (Discord, etc.)
+5. get_social_links(universe_ids) -> disabled no-op (see its own
+   docstring -- the endpoint requires real Roblox account auth)
 
 Notes on stability:
 - `games.roblox.com/v1/games?universeIds=...` (get_stats) is the well
@@ -422,39 +423,27 @@ async def get_icons(session: aiohttp.ClientSession, universe_ids):
 
 async def get_social_links(session: aiohttp.ClientSession, universe_ids, concurrency=3):
     """
-    Returns { universeId: {"discord": url_or_None} }
+    ALWAYS returns {} -- kept as a no-op stub rather than deleted so
+    callers (bot.py) don't need changes.
 
-    Unlike stats/votes/icons, this endpoint is per-universeId (no
-    batching), so we cap how many run concurrently to avoid hammering
-    RoProxy -- this is only called for games that already passed the
-    scouting filters, so the id list here is small (top matches, not
-    every candidate). Concurrency dropped from 5 to 3 to go a bit
-    easier on RoProxy given the broader 429 issues.
+    social-links/list requires a real, authenticated Roblox account
+    session (confirmed via a 401 "Authentication token is missing",
+    code 9002, and independently via noblox.js's client library, which
+    marks this specific endpoint as requiring a cookie jar unlike the
+    rest of the games.roblox.com endpoints we use). RoProxy only
+    mirrors *public, unauthenticated* endpoints -- it can't make this
+    one work no matter how we call it.
+
+    The only way to actually get Discord links here would be routing
+    a real Roblox account's .ROBLOSECURITY session cookie through
+    RoProxy on every request. That's not a throttling problem to
+    tune -- it's handing a third-party proxy a credential equivalent
+    to a password, on every single lookup, for a "nice to have" field.
+    Deliberately not doing that. If you want this back badly enough to
+    accept that tradeoff, it needs a real account + cookie wired in
+    explicitly, not a retry/backoff fix.
     """
-    universe_ids = list(universe_ids)
-    results = {}
-    semaphore = asyncio.Semaphore(concurrency)
-
-    async def fetch_one(uid):
-        async with semaphore:
-            data = await _fetch_json(
-                session,
-                SOCIAL_LINKS_URL.format(universe_id=uid),
-                params={},
-            )
-            discord_url = None
-            if data:
-                for link in data.get("data", []):
-                    if str(link.get("type", "")).lower() == "discord":
-                        discord_url = link.get("url")
-                        break
-            results[uid] = {"discord": discord_url}
-            await asyncio.sleep(0.4)
-
-    await asyncio.gather(*(fetch_one(uid) for uid in universe_ids))
-    found = sum(1 for v in results.values() if v.get("discord"))
-    print(f"[roblox_api] get_social_links: {found}/{len(universe_ids)} games have a linked Discord")
-    return results
+    return {}
 
 
 def apply_filters(games, min_ccu, max_visits):
